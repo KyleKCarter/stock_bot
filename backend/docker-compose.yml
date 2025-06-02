@@ -1,0 +1,23 @@
+services:
+  api:
+    build: .
+    command: node index.js
+    ports:
+      - "32224:32224"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  orbworker:
+    build: .
+    command: node ORB_Bot/orbWorker.js
+    env_file:
+      - .env
+    restart: unless-stopped
+  
+  vwapworker:
+    build: .
+    command: node VWAP_Bot/vwapWorker.js
+    env_file:
+      - .env
+    restart: unless-stopped

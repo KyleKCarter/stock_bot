@@ -1,0 +1,45 @@
+{
+  "name": "ai-bot-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "proxy": "http://localhost:5000",
+  "description": "A full-stack AI bot application with a React frontend and Express backend, utilizing PostgreSQL for data storage and Redux for state management.",
+  "keywords": [],
+  "author": "Kyle Carter",
+  "license": "ISC",
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "axios": "^1.9.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-redux": "^9.2.0",
+    "react-router-dom": "^7.6.1",
+    "react-scripts": "^5.0.1",
+    "redux": "^5.0.1",
+    "redux-promise-middleware": "^6.2.0",
+    "sass": "^1.89.0",
+    "web-vitals": "^5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": "react-app"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {}
+}
