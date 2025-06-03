@@ -31,7 +31,8 @@ const getOpeningRange = async (symbol) => {
         {
             timeframe: '1Min',
             start,
-            end
+            end,
+            feed: 'iex'
         },
         alpaca.configuration
     );
