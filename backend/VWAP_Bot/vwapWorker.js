@@ -39,8 +39,8 @@ cron.schedule('0-58 15 * * 1-5', async () => {
     await runForAllSymbols()
 }, { timezone: 'America/New_York' });
 
-// 4:00–4:30 PM weekdays
-cron.schedule('58 15 * * 1-5', async () => {
+// 4:28 PM weekdays
+cron.schedule('28 16 * * 1-5', async () => {
     console.log('Closing all positions before market close');
     for (const symbol of symbols) {
         try {

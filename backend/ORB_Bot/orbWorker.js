@@ -4,14 +4,14 @@ const ORBStockBot = require('./openingRangeBreakout');
 
 let isRunning = false; // Lock flag
 
-const ORDER_QTY = process.env.ORDER_QTY ? Number(process.env.ORDER_QTY) : 2;
+const ORDER_QTY = process.env.ORDER_QTY ? Number(process.env.ORDER_QTY) : 5;
 const stopLossPercent = process.env.STOP_LOSS ? Number(process.env.STOP_LOSS) : 0.01;
 const riskRewardRatio = process.env.RISK_REWARD ? Number(process.env.RISK_REWARD) : 3;
 
 const symbols = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'AMD', 'AMZN', 'META', 'MSFT']; // symbols
     // const symbols = ['SPY', 'QQQ', 'TSLA', 'NVDA']; // Today's symbols for testing
 
-cron.schedule('30-44 9 * * 1-5', async () => {
+cron.schedule('45-59 9 * * 1-5', async () => {
     if (isRunning) {
         console.log("Previous ORB task still running, skipping this run.");
         return; // Exit if already running

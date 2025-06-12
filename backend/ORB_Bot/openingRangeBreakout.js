@@ -29,7 +29,7 @@ const getOpeningRange = async (symbol) => {
     const barsIterable = await alpaca.getBarsV2(
         symbol, 
         {
-            timeframe: '1Min',
+            timeframe: '5Min',
             start,
             end,
             feed: 'iex'

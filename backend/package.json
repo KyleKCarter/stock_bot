@@ -21,6 +21,8 @@
     "express-session": "^1.18.1",
     "luxon": "^3.6.1",
     "massive": "^6.11.3",
+    "moment": "^2.30.1",
+    "moment-timezone": "^0.6.0",
     "node-cron": "^4.1.0",
     "pg": "^8.16.0",
     "ws": "^8.18.2"
