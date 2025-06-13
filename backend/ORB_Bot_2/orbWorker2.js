@@ -11,41 +11,32 @@ const riskRewardRatio = process.env.RISK_REWARD ? Number(process.env.RISK_REWARD
 
 const symbols = ['SPY', 'QQQ', 'TSLA', 'NVDA']; // Today's symbols for testing
 
+const orbReady = {}; // { [symbol]: true/false }
+
 // Helper to calculate ORB range for a specific window
 async function setORBRangeForWindow(symbol, startHour, startMinute, endHour, endMinute) {
     try {
+        console.log(`[${symbol}] Setting ORB range for ${startHour}:${startMinute} - ${endHour}:${endMinute}`);
         await ORBStockBot2.getORBRange(symbol, startHour, startMinute, endHour, endMinute);
+        orbReady[symbol] = true;
         console.log(`[${symbol}] ORB range set for ${startHour}:${startMinute.toString().padStart(2, '0')} - ${endHour}:${endMinute.toString().padStart(2, '0')}`);
     } catch (error) {
+        orbReady[symbol] = false;
         console.error(`[${symbol}] Error calculating ORB range for window:`, error);
     }
 }
 
 // Schedule ORB range calculation at 9:30, 9:40, and 9:45 AM ET
 const orbWindows = [
-    { startHour: 9, startMinute: 30, endHour: 9, endMinute: 39 },
-    { startHour: 9, startMinute: 40, endHour: 9, endMinute: 44 },
-    { startHour: 9, startMinute: 45, endHour: 9, endMinute: 59 }
+    { startHour: 9, startMinute: 30, endHour: 9, endMinute: 45 },
 ];
 
-[30, 40, 45].forEach(minute => {
-    cron.schedule(`${minute} 9 * * 1-5`, async () => {
-        if (isRunning) {
-            console.log("Previous ORB task still running, skipping this run.");
-            return;
-        }
-        isRunning = true;
-        try {
-            for (const symbol of symbols) {
-                const window = orbWindows[[30, 40, 45].indexOf(minute)];
-                await setORBRangeForWindow(symbol, window.startHour, window.startMinute, window.endHour, window.endMinute);
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-        } finally {
-            isRunning = false;
-        }
-    }, { timezone: 'America/New_York' });
-});
+cron.schedule('45 9 * * 1-5', async () => {
+    for (const symbol of symbols) {
+        await setORBRangeForWindow(symbol, 9, 30, 9, 45);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+}, { timezone: 'America/New_York' });
 
 // On startup, retroactively set ORB ranges for all windows if missed
 (async () => {
@@ -56,47 +47,64 @@ const orbWindows = [
             const windowEnd = moment().tz('America/New_York').hour(window.endHour).minute(window.endMinute).second(0);
             if (now.isAfter(windowEnd)) {
                 for (const symbol of symbols) {
-                    await setORBRangeForWindow(symbol, window.startHour, window.startMinute, window.endHour, window.endMinute);
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    if (!orbReady[symbol]) { // Only set if not already set
+                        await setORBRangeForWindow(symbol, window.startHour, window.startMinute, window.endHour, window.endMinute);
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    }
                 }
             }
         }
     }
 })();
 
-// Retest monitor: checks for retest and trade every minute from 9:46
-cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => { // Example: every minute in the 10am hour
-  for (const symbol of symbols) {
-    const state = ORBStockBot2.symbolState[symbol];
-    if (state && state.pendingRetest) {
-      try {
-        await ORBStockBot2.checkRetestAndTrade(symbol, state.pendingRetest);
-      } catch (error) {
-        console.error(`[${symbol}] Error in retest monitor:`, error.message);
-      }
+// Manual trigger to set ORB ranges for all symbols
+(async () => {
+    for (const [i, window] of orbWindows.entries()) {
+        for (const symbol of symbols) {
+            if (!orbReady[symbol]) {
+                await setORBRangeForWindow(symbol, window.startHour, window.startMinute, window.endHour, window.endMinute);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
     }
-  }
-}, { timezone: 'America/New_York' });
+})();
 
 // Monitor for breakouts for each symbol every minute from 9:46 to 12:59 PM ET
-cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => {
+cron.schedule('46-59 9,0-59 10-15 * * 1-5', async () => {
     if (isRunning) {
         console.log("Previous ORB task still running, skipping this run.");
         return;
     }
     isRunning = true;
     try {
-        for (const symbol of symbols) {
+        await Promise.all(symbols.map(async (symbol) => {
+            if (!orbReady[symbol]) {
+                console.log(`[${symbol}] ORB not ready, skipping breakout monitoring.`);
+                return;
+            }
             try {
                 await ORBStockBot2.monitorBreakout(symbol);
             } catch (error) {
                 console.error(`[${symbol}] Error monitoring breakout:`, error);
             }
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+        }));
     } finally {
         isRunning = false;
     }
+}, { timezone: 'America/New_York' });
+
+// Retest monitor: checks for retest and trade every minute from 9:46
+cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => { // Example: every minute in the 10am hour
+  await Promise.all(symbols.map(async (symbol) => {
+        const state = ORBStockBot2.symbolState[symbol];
+        if (state && state.pendingRetest) {
+            try {
+                await ORBStockBot2.checkRetestAndTrade(symbol, state.pendingRetest);
+            } catch (error) {
+                console.error(`[${symbol}] Error in retest monitor:`, error.message);
+            }
+        }
+    }));
 }, { timezone: 'America/New_York' });
 
 // Close all positions at 4:00 PM ET
