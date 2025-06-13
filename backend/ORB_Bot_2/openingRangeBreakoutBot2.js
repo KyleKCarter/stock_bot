@@ -188,59 +188,6 @@ async function monitorBreakout(symbol) {
     console.log(`[${symbol}] No confirmed breakout. Latest vol: ${latest.Volume}, Avg vol: ${avgVol.toFixed(2)}`);  }
 }
 
-// async function checkRetestAndTrade(symbol, { direction, breakoutLevel }) {
-//   // Fetch last 3 one-minute bars
-//   const bars = await alpaca.getBarsV2(symbol, {
-//     timeframe: '1Min',
-//     limit: 3
-//   }, alpaca.configuration);
-
-//   const candles = [];
-//   for await (let c of bars) candles.push(c);
-
-//   // Sort by timestamp to ensure correct order
-//   candles.sort((a, b) => new Date(a.Timestamp) - new Date(b.Timestamp));
-//   if (candles.length < 2) return;
-
-//   // Look for a retest: previous candle touches or crosses the breakout level, and latest candle closes back in breakout direction
-//   const prev = candles[candles.length - 2];
-//   const latest = candles[candles.length - 1];
-
-//   // Console logs for mock testing
-//   console.log(`[${symbol}] Retest check: direction=${direction}, breakoutLevel=${breakoutLevel}`);
-//   console.log(`[${symbol}] Prev 1-min bar:`, prev);
-//   console.log(`[${symbol}] Latest 1-min bar:`, latest);
-
-//   let retest = false;
-//   if (direction === 'long') {
-//     // Retest if previous candle low <= breakoutLevel and latest closes above breakoutLevel
-//     retest = prev.LowPrice <= breakoutLevel && latest.ClosePrice > breakoutLevel;
-//     console.log(`[${symbol}] Long retest logic: prev.LowPrice (${prev.LowPrice}) <= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latest.ClosePrice}) > breakoutLevel (${breakoutLevel}) => ${retest}`);
-//   } else {
-//     // Retest if previous candle high >= breakoutLevel and latest closes below breakoutLevel
-//     retest = prev.HighPrice >= breakoutLevel && latest.ClosePrice < breakoutLevel;
-//     console.log(`[${symbol}] Short retest logic: prev.HighPrice (${prev.HighPrice}) >= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latest.ClosePrice}) < breakoutLevel (${breakoutLevel}) => ${retest}`);
-//   }
-
-//   if (retest && !symbolState[symbol].inPosition) {
-//     console.log(`[${symbol}] Retest confirmed (${direction}) at ${breakoutLevel}. Entering trade.`);
-//     const entry = latest.ClosePrice;
-//     const stop = direction === 'long' ? latest.LowPrice : latest.HighPrice;
-//     const target = direction === 'long'
-//       ? entry + (entry - stop) * MIN_RRR
-//       : entry - (stop - entry) * MIN_RRR;
-//     try {
-//         await placeBracketOrder(symbol, direction, entry, stop, target);
-//         symbolState[symbol].inPosition = true;
-//         symbolState[symbol].pendingRetest = null; // Clear pending retest
-//     } catch (error) {
-//         console.error(`[${symbol}] Error placing order:`, error.message);
-//     }
-//   } else if (!retest) {
-//     console.log(`[${symbol}] No retest confirmation for ${direction} at ${breakoutLevel}.`);
-//   }
-// }
-
 async function checkRetestAndTrade(symbol, retestObj) {
     // Accepts either (symbol, breakoutLevel) or (symbol, {direction, breakoutLevel, barsSinceBreakout})
     let direction, breakoutLevel;
