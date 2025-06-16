@@ -99,7 +99,10 @@ cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => { // Example: every minu
         const state = ORBStockBot2.symbolState[symbol];
         if (state && state.pendingRetest) {
             try {
-                await ORBStockBot2.checkRetestAndTrade(symbol, state.pendingRetest);
+                await ORBStockBot2.checkRetestAndTrade(symbol, {
+                    direction: state.pendingRetest.direction,
+                    breakoutLevel: Number(state.pendingRetest.breakoutLevel)
+                });
             } catch (error) {
                 console.error(`[${symbol}] Error in retest monitor:`, error.message);
             }

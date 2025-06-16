@@ -58,6 +58,7 @@ async function getORBRange(symbol, startHour = 9, startMinute = 30, endHour = 9,
         new Date(c.Timestamp) >= orbStart.toDate() &&
         new Date(c.Timestamp) <= orbEnd.toDate()
     );
+
     const orbHigh = Math.max(...orbWindow.map(c => c.HighPrice));
     const orbLow = Math.min(...orbWindow.map(c => c.LowPrice));
 
@@ -128,45 +129,57 @@ async function monitorBreakout(symbol) {
   for await (let c of bars) candles.push(c);
 
   candles.sort((a, b) => new Date(a.Timestamp) - new Date(b.Timestamp));
+
+  const orbBars = candles.filter(c =>
+    new Date(c.Timestamp) >= sessionStart.toDate() &&
+    new Date(c.Timestamp) <= orbEnd.toDate()
+  );
   
   // Only use bars after the ORB window for volume filter
-  const postORB = candles.filter(c => new Date(c.Timestamp) > orbEnd.toDate());
+  // Find the max timestamp in the ORB window
+  const orbEndTime = Math.max(...orbBars.map(c => new Date(c.Timestamp).getTime()));
+  const postORB = candles.filter(c => new Date(c.Timestamp).getTime() > orbEndTime);
 
-  console.log('All candles:', candles.map(c => c.Timestamp));
   console.log('ORB End:', orbEnd.toISOString());
-  console.log('Post-ORB:', postORB.map(c => c.Timestamp));
   console.log('Post-ORB count:', postORB.length);
 
-  if (postORB.length < 2) {
+  if (postORB.length < 1) {
     console.log(`[${symbol}] Not enough post-ORB bars for breakout monitoring.`);
     return;
   }
 
   // Use the last 10 post-ORB bars for volume filter
-  const recent = postORB.slice(-10, -1); // up to 9 bars before the latest
+  const recent = postORB.length > 4
+    ? postORB.slice(1, -1).slice(-3)
+    : postORB.slice(-4, -1); // fallback if not enough bars yet
   const latest = postORB[postORB.length - 1];
 
-  if (!latest || recent.length < 1) {
-    console.log(`[${symbol}] Not enough recent post-ORB bars for volume filter.`);
+  if (!latest) {
+    console.log(`[${symbol}] No latest post-ORB bar.`);
     return;
   }
 
-  console.log(`[${symbol}] Recent post-ORB volumes:`, recent.map(c => c.Volume));
-  console.log(`[${symbol}] Latest post-ORB bar volume:`, latest.Volume);
+  let volConfirmed = true;
+  let avgVol = 0;
+  let medianVol = 0;
 
-  // Calculate average volume
-  const avgVol = recent.reduce((sum, c) => sum + c.Volume, 0) / recent.length;
+  if (recent.length >= 1) {
+    avgVol = recent.reduce((sum, c) => sum + c.Volume, 0) / recent.length;
+    const sortedVols = recent.map(c => c.Volume).sort((a, b) => a - b);
+    medianVol = sortedVols.length % 2 === 0
+    ? (sortedVols[sortedVols.length / 2 - 1] + sortedVols[sortedVols.length / 2]) / 2
+    : sortedVols[Math.floor(sortedVols.length / 2)];
+    volConfirmed = latest.Volume > avgVol && latest.Volume > medianVol;
+    console.log(`[${symbol}] Recent post-ORB volumes:`, recent.map(c => c.Volume));
+    console.log(`[${symbol}] Latest post-ORB bar volume:`, latest.Volume);
+    console.log(`[${symbol}] Avg vol: ${avgVol.toFixed(2)}, Median vol: ${medianVol.toFixed(2)}`);
+  } else {
+    // First post-ORB bar, allow breakout (or optionally check against a static threshold)
+    console.log(`[${symbol}] Only one post-ORB bar, skipping volume filter.`);
+    console.log(`[${symbol}] Latest post-ORB bar volume:`, latest.Volume);
+  }
 
-  // Calculate median volume
-  const sortedVols = recent.map(c => c.Volume).sort((a, b) => a - b);
-  const medianVol = sortedVols.length % 2 === 0
-  ? (sortedVols[sortedVols.length / 2 - 1] + sortedVols[sortedVols.length / 2]) / 2
-  : sortedVols[Math.floor(sortedVols.length / 2)];
-
-  // Require latest volume to be greater than both average and median
-  const volConfirmed = latest.Volume > avgVol && latest.Volume > medianVol;
-
-  console.log(`[${symbol}] Avg vol: ${avgVol.toFixed(2)}, Median vol: ${medianVol.toFixed(2)}`);
+  console.log(`[${symbol}] DEBUG: ORB High=${symbolState[symbol].orbHigh}, ORB Low=${symbolState[symbol].orbLow}, Latest Close=${latest.ClosePrice}`);
 
   let breakout = null;
   if (latest.ClosePrice > symbolState[symbol].orbHigh && volConfirmed) {
@@ -183,25 +196,34 @@ async function monitorBreakout(symbol) {
         direction: breakout.direction,
         breakoutLevel: breakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow
     };
-    // await confirmRetestAndTrade(symbol, breakout);
+    await checkRetestAndTrade(symbol, {
+          direction: breakout.direction,
+          breakoutLevel: breakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow
+    });
   } else {
     console.log(`[${symbol}] No confirmed breakout. Latest vol: ${latest.Volume}, Avg vol: ${avgVol.toFixed(2)}`);  }
 }
 
 async function checkRetestAndTrade(symbol, retestObj) {
-    // Accepts either (symbol, breakoutLevel) or (symbol, {direction, breakoutLevel, barsSinceBreakout})
+    // Defensive debug log
+    console.log(`[${symbol}] DEBUG checkRetestAndTrade input:`, JSON.stringify(retestObj));
+
     let direction, breakoutLevel;
     if (typeof retestObj === 'object' && retestObj !== null && 'breakoutLevel' in retestObj) {
         direction = retestObj.direction;
-        breakoutLevel = retestObj.breakoutLevel;
-        // Track bars since breakout for timeout logic
+        breakoutLevel = Number(retestObj.breakoutLevel);
         symbolState[symbol].pendingRetest = symbolState[symbol].pendingRetest || {};
         symbolState[symbol].pendingRetest.barsSinceBreakout = (symbolState[symbol].pendingRetest.barsSinceBreakout || 0) + 1;
     } else {
-        direction = 'long'; // fallback for legacy calls
-        breakoutLevel = retestObj;
+        direction = 'long';
+        breakoutLevel = Number(retestObj);
         symbolState[symbol].pendingRetest = symbolState[symbol].pendingRetest || {};
         symbolState[symbol].pendingRetest.barsSinceBreakout = (symbolState[symbol].pendingRetest.barsSinceBreakout || 0) + 1;
+    }
+
+    if (isNaN(breakoutLevel)) {
+        console.error(`[${symbol}] Invalid breakoutLevel:`, breakoutLevel, retestObj);
+        return;
     }
 
     const now = moment().tz('America/New_York');
@@ -215,7 +237,8 @@ async function checkRetestAndTrade(symbol, retestObj) {
                 start: from,
                 end: to,
                 timeframe: '1Min',
-                adjustment: 'raw'
+                adjustment: 'raw',
+                feed: 'iex'
             },
             alpaca.configuration
         );
@@ -247,10 +270,10 @@ async function checkRetestAndTrade(symbol, retestObj) {
             console.log(`[${symbol}] Short retest logic: prev.HighPrice (${previousCandle.HighPrice}) >= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latestCandle.ClosePrice}) < breakoutLevel (${breakoutLevel}) => ${retest}`);
         }
 
-        // --- NEW: Timeout logic for "no retest" after N bars ---
         const MAX_BARS_WITHOUT_RETEST = 5;
         const barsSinceBreakout = symbolState[symbol].pendingRetest.barsSinceBreakout || 0;
 
+        // --- Timeout entry logic ---
         if (!retest && barsSinceBreakout >= MAX_BARS_WITHOUT_RETEST && !symbolState[symbol].inPosition) {
             console.log(`[${symbol}] No retest after ${MAX_BARS_WITHOUT_RETEST} bars. Entering trade at market.`);
             const entry = latestCandle.ClosePrice;
@@ -262,12 +285,18 @@ async function checkRetestAndTrade(symbol, retestObj) {
                 await placeBracketOrder(symbol, direction, entry, stop, target);
                 symbolState[symbol].inPosition = true;
                 symbolState[symbol].pendingRetest = null;
+                symbolState[symbol].barsSinceBreakout = 0;
+                console.log(`[${symbol}] Timeout entry: Bracket order submitted and state updated.`);
             } catch (error) {
-                console.error(`[${symbol}] Error placing order:`, error.message);
+                symbolState[symbol].inPosition = false;
+                symbolState[symbol].pendingRetest = null;
+                symbolState[symbol].barsSinceBreakout = 0;
+                console.error(`[${symbol}] Error placing order (timeout entry):`, error, error?.message);
             }
             return;
         }
 
+        // --- Retest confirmed logic ---
         if (retest && !symbolState[symbol].inPosition) {
             console.log(`[${symbol}] Retest confirmed (${direction}) at ${breakoutLevel}. Entering trade.`);
             const entry = latestCandle.ClosePrice;
@@ -278,9 +307,14 @@ async function checkRetestAndTrade(symbol, retestObj) {
             try {
                 await placeBracketOrder(symbol, direction, entry, stop, target);
                 symbolState[symbol].inPosition = true;
-                symbolState[symbol].pendingRetest = null; // Clear pending retest
+                symbolState[symbol].pendingRetest = null;
+                symbolState[symbol].barsSinceBreakout = 0;
+                console.log(`[${symbol}] Bracket order submitted and state updated.`);
             } catch (error) {
-                console.error(`[${symbol}] Error placing order:`, error.message);
+                symbolState[symbol].inPosition = false;
+                symbolState[symbol].pendingRetest = null;
+                symbolState[symbol].barsSinceBreakout = 0;
+                console.error(`[${symbol}] Error placing order (retest):`, error, error?.message);
             }
         } else if (!retest) {
             console.log(`[${symbol}] No retest confirmation for ${direction} at ${breakoutLevel}.`);
