@@ -13,14 +13,30 @@ const MIN_RRR = 2; // Risk-Reward Ratio
 
 // State per symbol
 const symbolState = {}; // { [symbol]: { orbHigh, orbLow, inPosition } }
+symbolState[symbol] = symbolState[symbol] || {};
+symbolState[symbol].tradeType = null; // 'breakout' or 'retest'
 
 // --- Utility Functions ---
 
 function calculatePositionSize(accountEquity, riskPercent, entry, stop) {
   const riskAmount = accountEquity * riskPercent;
   const perShareRisk = Math.abs(entry - stop);
-  const size = Math.floor(riskAmount / perShareRisk);
+  if (perShareRisk < 0.01) return 1; // Prevent division by near-zero
+  let size = Math.floor(riskAmount / perShareRisk);
+  const MAX_SIZE = 20; // <-- Set your max position size here
+  if (size > MAX_SIZE) size = MAX_SIZE;
   return size > 0 ? size : 1;
+}
+
+function resetDailyTradeFlags() {
+  const today = moment().tz('America/New_York').format('YYYY-MM-DD');
+  for (const symbol in symbolState) {
+    if (symbolState[symbol].lastTradeDate !== today) {
+      symbolState[symbol].hasTradedToday = false;
+      symbolState[symbol].lastTradeDate = today;
+      symbolState[symbol].tradeType = null;
+    }
+  }
 }
 
 // --- ORB Range Calculation ---
@@ -71,6 +87,40 @@ async function getORBRange(symbol, startHour = 9, startMinute = 30, endHour = 9,
     console.log(`[${symbol}] ORB High: ${symbolState[symbol].orbHigh}, ORB Low: ${symbolState[symbol].orbLow}`);
 }
 
+// --- State Sync Helper ---
+async function syncInPositionWithAlpaca(symbol) {
+  try {
+    const position = await alpaca.getPosition(symbol);
+    symbolState[symbol] = symbolState[symbol] || {};
+    symbolState[symbol].inPosition = !!position && Number(position.qty) > 0;
+    console.log(`[${symbol}] Synced inPosition with Alpaca:`, symbolState[symbol].inPosition);
+  } catch (err) {
+    // If no position exists, Alpaca throws 404
+    symbolState[symbol] = symbolState[symbol] || {};
+    symbolState[symbol].inPosition = false;
+    if (err.statusCode === 404 || (err.response && err.response.status === 404)) {
+      console.log(`[${symbol}] No open position on Alpaca. inPosition set to false.`);
+    } else {
+      console.error(`[${symbol}] Error syncing inPosition:`, err, err?.response?.data);
+    }
+  }
+}
+
+async function hasOpenOrder(symbol) {
+  try {
+    const orders = await alpaca.getOrders({
+      status: 'open',
+      symbols: [symbol],
+      direction: 'desc',
+      limit: 10
+    });
+    return orders && orders.length > 0;
+  } catch (error) {
+    console.error(`[${symbol}] Error checking open orders:`, error, error?.response?.data);
+    return false;
+  }
+}
+
 // --- Order Placement ---
 
 async function placeBracketOrder(symbol, direction, entry, stop, target) {
@@ -79,21 +129,25 @@ async function placeBracketOrder(symbol, direction, entry, stop, target) {
     const qty = calculatePositionSize(Number(account.equity), 0.01, entry, stop);
     const side = direction === 'long' ? 'buy' : 'sell';
 
+    // Round prices to 2 decimals for stocks
+    const round2 = x => Math.round(x * 100) / 100;
+
     const order = await alpaca.createOrder({
       symbol,
       qty,
       side,
       type: 'limit',
       time_in_force: 'gtc',
-      limit_price: entry,
+      limit_price: round2(entry),
       order_class: 'bracket',
-      stop_loss: { stop_price: stop },
-      take_profit: { limit_price: target }
+      stop_loss: { stop_price: round2(stop) },
+      take_profit: { limit_price: round2(target) }
     });
 
+    console.log(`[${symbol}] Calculated position size: ${qty} (entry: ${entry}, stop: ${stop})`);
     console.log(`[${symbol}] Order placed:`, order.id || order);
   } catch (error) {
-    console.error(`[${symbol}] Error placing bracket order:`, error.message);
+    console.error(`[${symbol}] Error placing bracket order:`, error, error?.response?.data);
   }
 }
 
@@ -102,6 +156,24 @@ async function placeBracketOrder(symbol, direction, entry, stop, target) {
 async function monitorBreakout(symbol) {
   if (!symbolState[symbol] || symbolState[symbol].orbHigh == null || symbolState[symbol].orbLow == null) {
     console.log(`[${symbol}] ORB range not set. Skipping breakout monitoring.`);
+    return;
+  }
+
+  const today = moment().tz('America/New_York').format('YYYY-MM-DD');
+  const now = moment().tz('America/New_York');
+  const cutoff = moment().tz('America/New_York').hour(14).minute(0).second(0); // set to 11:30 AM ET cutoff when ready to go live
+
+  if (now.isAfter(cutoff)) {
+    console.log(`[${symbol}] Past trading cutoff time. Skipping.`);
+    return;
+  }
+  if (symbolState[symbol].hasTradedToday && symbolState[symbol].lastTradeDate === today) {
+    console.log(`[${symbol}] Already traded today. Skipping.`);
+    return;
+  }
+    
+  if (symbolState[symbol].tradeType) {
+    console.log(`[${symbol}] Trade already taken (${symbolState[symbol].tradeType}). Skipping further entries.`);
     return;
   }
   
@@ -115,7 +187,6 @@ async function monitorBreakout(symbol) {
     return;
   }
 
-  const now = moment().tz('America/New_York')
   const sessionStart = moment().tz('America/New_York').hour(9).minute(30).second(0).millisecond(0);
   const orbEnd = moment().tz('America/New_York').hour(9).minute(45).second(0).millisecond(0);
   const bars = await alpaca.getBarsV2(symbol, {
@@ -169,7 +240,9 @@ async function monitorBreakout(symbol) {
     medianVol = sortedVols.length % 2 === 0
     ? (sortedVols[sortedVols.length / 2 - 1] + sortedVols[sortedVols.length / 2]) / 2
     : sortedVols[Math.floor(sortedVols.length / 2)];
-    volConfirmed = latest.Volume > avgVol && latest.Volume > medianVol;
+    // volConfirmed = latest.Volume > avgVol && latest.Volume > medianVol;
+    volConfirmed = latest.Volume > avgVol * 1.2;
+    // volConfirmed = latest.Volume > medianVol * 1.2;
     console.log(`[${symbol}] Recent post-ORB volumes:`, recent.map(c => c.Volume));
     console.log(`[${symbol}] Latest post-ORB bar volume:`, latest.Volume);
     console.log(`[${symbol}] Avg vol: ${avgVol.toFixed(2)}, Median vol: ${medianVol.toFixed(2)}`);
@@ -191,22 +264,44 @@ async function monitorBreakout(symbol) {
   console.log(`[${symbol}] DEBUG: ORB High=${symbolState[symbol].orbHigh}, ORB Low=${symbolState[symbol].orbLow}, Latest Close=${latest.ClosePrice}`);
 
   if (breakout) {
-    console.log(`[${symbol}] Confirmed breakout (${breakout.direction}) on volume: ${latest.Volume} > ${avgVol.toFixed(2)}`);
+      console.log(`[${symbol}] Confirmed breakout (${breakout.direction}) on volume: ${latest.Volume} > ${avgVol.toFixed(2)}`);
+      // Pro-style: Enter immediately on breakout if not in position and no open order
+      if (!symbolState[symbol].inPosition && !(await hasOpenOrder(symbol))) {
+        const round2 = x => Math.round(x * 100) / 100;
+        const entry = round2(latest.ClosePrice);
+        const stop = round2(breakout.direction === 'long' ? latest.LowPrice : latest.HighPrice);
+        const target = round2(
+          breakout.direction === 'long'
+          ? entry + (entry - stop) * MIN_RRR
+          : entry - (stop - entry) * MIN_RRR
+        );
+        await placeBracketOrder(symbol, breakout.direction, entry, stop, target);
+        symbolState[symbol].inPosition = true;
+        symbolState[symbol].pendingRetest = null;
+        symbolState[symbol].barsSinceBreakout = 0;
+        symbolState[symbol].hasTradedToday = true;
+        symbolState[symbol].lastTradeDate = today;
+        symbolState[symbol].tradeType = 'breakout';
+        await module.exports.syncInPositionWithAlpaca(symbol);
+        console.log(`[${symbol}] Entered trade on breakout bar.`);
+      } else {
+        // If already in position or open order, skip
+        console.log(`[${symbol}] Skipping breakout entry: already in position or open order.`);
+      }
+    // Optionally, still track for retest if you want to scale in or re-enter
     symbolState[symbol].pendingRetest = {
-        direction: breakout.direction,
-        breakoutLevel: breakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow
+      direction: breakout.direction,
+      breakoutLevel: breakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow
     };
-    await checkRetestAndTrade(symbol, {
-          direction: breakout.direction,
-          breakoutLevel: breakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow
-    });
-  } else {
-    console.log(`[${symbol}] No confirmed breakout. Latest vol: ${latest.Volume}, Avg vol: ${avgVol.toFixed(2)}`);  }
+  }
 }
 
 async function checkRetestAndTrade(symbol, retestObj) {
     // Defensive debug log
     console.log(`[${symbol}] DEBUG checkRetestAndTrade input:`, JSON.stringify(retestObj));
+
+    // Always resync inPosition before making a trade decision
+    await module.exports.syncInPositionWithAlpaca(symbol);
 
     let direction, breakoutLevel;
     if (typeof retestObj === 'object' && retestObj !== null && 'breakoutLevel' in retestObj) {
@@ -226,9 +321,29 @@ async function checkRetestAndTrade(symbol, retestObj) {
         return;
     }
 
+    const today = moment().tz('America/New_York').format('YYYY-MM-DD');
     const now = moment().tz('America/New_York');
+    const cutoff = moment().tz('America/New_York').hour(14).minute(0).second(0); // set to 11:30 AM ET cutoff when ready to go live
     const from = now.clone().subtract(4, 'minutes').toISOString();
     const to = now.clone().subtract(1, 'minutes').toISOString();
+
+    if (now.isAfter(cutoff)) {
+      console.log(`[${symbol}] Past trading cutoff time. Skipping retest.`);
+      return;
+    }
+
+    if (
+      symbolState[symbol].hasTradedToday &&
+      symbolState[symbol].lastTradeDate === today
+    ) {
+      console.log(`[${symbol}] Already traded today. Skipping retest.`);
+      return;
+    }
+
+    if (symbolState[symbol].tradeType) {
+      console.log(`[${symbol}] Trade already taken (${symbolState[symbol].tradeType}). Skipping retest.`);
+      return;
+    }
 
     try {
         const barIterator = await alpaca.getBarsV2(
@@ -272,54 +387,80 @@ async function checkRetestAndTrade(symbol, retestObj) {
 
         const MAX_BARS_WITHOUT_RETEST = 5;
         const barsSinceBreakout = symbolState[symbol].pendingRetest.barsSinceBreakout || 0;
+        const round2 = x => Math.round(x * 100) / 100;
 
         // --- Timeout entry logic ---
         if (!retest && barsSinceBreakout >= MAX_BARS_WITHOUT_RETEST && !symbolState[symbol].inPosition) {
             console.log(`[${symbol}] No retest after ${MAX_BARS_WITHOUT_RETEST} bars. Entering trade at market.`);
-            const entry = latestCandle.ClosePrice;
-            const stop = direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice;
-            const target = direction === 'long'
-                ? entry + (entry - stop) * MIN_RRR
-                : entry - (stop - entry) * MIN_RRR;
+            const entry = round2(latestCandle.ClosePrice);
+            const stop = round2(direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice);
+            const target = round2(direction === 'long'
+              ? entry + (entry - stop) * MIN_RRR
+              : entry - (stop - entry) * MIN_RRR);
+
+            if (await hasOpenOrder(symbol)) {
+              console.log(`[${symbol}] Skipping order: open order already exists.`);
+              return;
+            }
+
             try {
                 await placeBracketOrder(symbol, direction, entry, stop, target);
                 symbolState[symbol].inPosition = true;
                 symbolState[symbol].pendingRetest = null;
                 symbolState[symbol].barsSinceBreakout = 0;
+                symbolState[symbol].hasTradedToday = true;
+                symbolState[symbol].lastTradeDate = today;
                 console.log(`[${symbol}] Timeout entry: Bracket order submitted and state updated.`);
+                await module.exports.syncInPositionWithAlpaca(symbol);
             } catch (error) {
                 symbolState[symbol].inPosition = false;
                 symbolState[symbol].pendingRetest = null;
                 symbolState[symbol].barsSinceBreakout = 0;
-                console.error(`[${symbol}] Error placing order (timeout entry):`, error, error?.message);
+                console.error(`[${symbol}] Error placing order (retest):`, error, error?.response?.data);
+                await module.exports.syncInPositionWithAlpaca(symbol);
             }
             return;
         }
 
         // --- Retest confirmed logic ---
-        if (retest && !symbolState[symbol].inPosition) {
-            console.log(`[${symbol}] Retest confirmed (${direction}) at ${breakoutLevel}. Entering trade.`);
-            const entry = latestCandle.ClosePrice;
-            const stop = direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice;
-            const target = direction === 'long'
-                ? entry + (entry - stop) * MIN_RRR
-                : entry - (stop - entry) * MIN_RRR;
-            try {
-                await placeBracketOrder(symbol, direction, entry, stop, target);
-                symbolState[symbol].inPosition = true;
-                symbolState[symbol].pendingRetest = null;
-                symbolState[symbol].barsSinceBreakout = 0;
-                console.log(`[${symbol}] Bracket order submitted and state updated.`);
-            } catch (error) {
-                symbolState[symbol].inPosition = false;
-                symbolState[symbol].pendingRetest = null;
-                symbolState[symbol].barsSinceBreakout = 0;
-                console.error(`[${symbol}] Error placing order (retest):`, error, error?.message);
+        if (retest) {
+            if (symbolState[symbol].inPosition) {
+                console.log(`[${symbol}] Skipping order: already in position.`);
+            } else {
+                console.log(`[${symbol}] Retest confirmed (${direction}) at ${breakoutLevel}. Entering trade.`);
+                const entry = round2(latestCandle.ClosePrice);
+                const stop = round2(direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice);
+                const target = round2(direction === 'long'
+                  ? entry + (entry - stop) * MIN_RRR
+                  : entry - (stop - entry) * MIN_RRR);
+
+                if (await hasOpenOrder(symbol)) {
+                  console.log(`[${symbol}] Skipping order: open order already exists.`);
+                  return;
+                }
+
+                try {
+                    console.log(`[${symbol}] Placing bracket order...`);
+                    await placeBracketOrder(symbol, direction, entry, stop, target);
+                    symbolState[symbol].inPosition = true;
+                    symbolState[symbol].pendingRetest = null;
+                    symbolState[symbol].barsSinceBreakout = 0;
+                    symbolState[symbol].hasTradedToday = true;
+                    symbolState[symbol].lastTradeDate = today;
+                    symbolState[symbol].tradeType = 'retest';
+                    console.log(`[${symbol}] Bracket order submitted and state updated.`);
+                    await module.exports.syncInPositionWithAlpaca(symbol);
+                } catch (error) {
+                    symbolState[symbol].inPosition = false;
+                    symbolState[symbol].pendingRetest = null;
+                    symbolState[symbol].barsSinceBreakout = 0;
+                    console.error(`[${symbol}] Error placing order (retest):`, error, error?.response?.data);
+                    await module.exports.syncInPositionWithAlpaca(symbol);
+                }
             }
-        } else if (!retest) {
+        } else {
             console.log(`[${symbol}] No retest confirmation for ${direction} at ${breakoutLevel}.`);
         }
-
     } catch (fetchError) {
         console.error(`[${symbol}] Error fetching bars with getBarsV2:`, fetchError?.response?.data || fetchError.message);
     }
@@ -335,11 +476,12 @@ async function closePosition(symbol) {
     symbolState[symbol] = symbolState[symbol] || {};
     symbolState[symbol].inPosition = false;
     console.log(`[${symbol}] Position closed.`);
+    await module.exports.syncInPositionWithAlpaca(symbol);
   } catch (error) {
     if (error.response && error.response.status === 404) {
       console.log(`[${symbol}] No open position to close.`);
     } else {
-      console.error(`[${symbol}] Error closing position:`, error.message);
+      console.error(`[${symbol}] Error closing position:`, error, error?.response?.data);
     }
   }
 }
@@ -354,5 +496,7 @@ module.exports = {
   checkRetestAndTrade,
   closePosition,
   symbolState,
-  alpaca
+  alpaca,
+  syncInPositionWithAlpaca,
+  resetDailyTradeFlags
 };

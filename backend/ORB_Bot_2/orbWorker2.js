@@ -9,7 +9,7 @@ const ORDER_QTY = process.env.ORDER_QTY ? Number(process.env.ORDER_QTY) : 5;
 const stopLossPercent = process.env.STOP_LOSS ? Number(process.env.STOP_LOSS) : 0.01;
 const riskRewardRatio = process.env.RISK_REWARD ? Number(process.env.RISK_REWARD) : 3;
 
-const symbols = ['SPY', 'QQQ', 'TSLA', 'NVDA']; // Today's symbols for testing
+const symbols = ['SPY', 'QQQ', 'TSLA', 'NVDA', 'AMD']; // Today's symbols for testing
 
 const orbReady = {}; // { [symbol]: true/false }
 
@@ -32,6 +32,9 @@ const orbWindows = [
 ];
 
 cron.schedule('45 9 * * 1-5', async () => {
+
+    ORBStockBot2.resetDailyTradeFlags(); // Reset daily trade flags at the start of each monitoring period
+    
     for (const symbol of symbols) {
         await setORBRangeForWindow(symbol, 9, 30, 9, 45);
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -69,8 +72,22 @@ cron.schedule('45 9 * * 1-5', async () => {
     }
 })();
 
+// Sync inPosition state with Alpaca on startup
+(async () => {
+    console.log("Syncing inPosition state with Alpaca...");
+    for (const symbol of symbols) {
+        try {
+            await ORBStockBot2.syncInPositionWithAlpaca(symbol);
+        } catch (err) {
+            console.error(`[${symbol}] Error syncing inPosition on startup:`, err.message);
+        }
+    }
+    console.log("Finished syncing inPosition state.");
+})();
+
 // Monitor for breakouts for each symbol every minute from 9:46 to 12:59 PM ET
 cron.schedule('46-59 9,0-59 10-15 * * 1-5', async () => {
+
     if (isRunning) {
         console.log("Previous ORB task still running, skipping this run.");
         return;
