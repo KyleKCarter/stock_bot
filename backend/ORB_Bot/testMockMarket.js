@@ -1,4 +1,4 @@
-const ORBStockBot2 = require('./openingRangeBreakoutBot2');
+const ORBStockBot2 = require('./openingRangeBreakoutBot');
 const { mock5MinBars, mock1MinBars } = require('./mockData');
 
 function delay(ms) {

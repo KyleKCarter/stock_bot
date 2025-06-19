@@ -14,13 +14,6 @@ services:
     env_file:
       - .env
     restart: unless-stopped
-
-  orbworker2:
-    build: .
-    command: node ORB_Bot_2/orbWorker2.js
-    env_file:
-      - .env
-    restart: unless-stopped
   
   vwapworker:
     build: .

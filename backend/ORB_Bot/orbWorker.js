@@ -1,7 +1,7 @@
 require('dotenv').config();
 const cron = require('node-cron');
 const moment = require('moment-timezone');
-const ORBStockBot2 = require('./openingRangeBreakoutBot2');
+const ORBStockBot = require('./openingRangeBreakoutBot');
 
 let isRunning = false; // Lock flag
 
@@ -17,7 +17,7 @@ const orbReady = {}; // { [symbol]: true/false }
 async function setORBRangeForWindow(symbol, startHour, startMinute, endHour, endMinute) {
     try {
         console.log(`[${symbol}] Setting ORB range for ${startHour}:${startMinute} - ${endHour}:${endMinute}`);
-        await ORBStockBot2.getORBRange(symbol, startHour, startMinute, endHour, endMinute);
+        await ORBStockBot.getORBRange(symbol, startHour, startMinute, endHour, endMinute);
         orbReady[symbol] = true;
         console.log(`[${symbol}] ORB range set for ${startHour}:${startMinute.toString().padStart(2, '0')} - ${endHour}:${endMinute.toString().padStart(2, '0')}`);
     } catch (error) {
@@ -33,7 +33,7 @@ const orbWindows = [
 
 cron.schedule('45 9 * * 1-5', async () => {
 
-    ORBStockBot2.resetDailyTradeFlags(); // Reset daily trade flags at the start of each monitoring period
+    ORBStockBot.resetDailyTradeFlags(); // Reset daily trade flags at the start of each monitoring period
     
     for (const symbol of symbols) {
         await setORBRangeForWindow(symbol, 9, 30, 9, 45);
@@ -77,7 +77,7 @@ cron.schedule('45 9 * * 1-5', async () => {
     console.log("Syncing inPosition state with Alpaca...");
     for (const symbol of symbols) {
         try {
-            await ORBStockBot2.syncInPositionWithAlpaca(symbol);
+            await ORBStockBot.syncInPositionWithAlpaca(symbol);
         } catch (err) {
             console.error(`[${symbol}] Error syncing inPosition on startup:`, err.message);
         }
@@ -100,7 +100,7 @@ cron.schedule('46-59 9,0-59 10-15 * * 1-5', async () => {
                 return;
             }
             try {
-                await ORBStockBot2.monitorBreakout(symbol);
+                await ORBStockBot.monitorBreakout(symbol);
             } catch (error) {
                 console.error(`[${symbol}] Error monitoring breakout:`, error);
             }
@@ -113,10 +113,10 @@ cron.schedule('46-59 9,0-59 10-15 * * 1-5', async () => {
 // Retest monitor: checks for retest and trade every minute from 9:46
 cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => { // Example: every minute in the 10am hour
   await Promise.all(symbols.map(async (symbol) => {
-        const state = ORBStockBot2.symbolState[symbol];
+        const state = ORBStockBot.symbolState[symbol];
         if (state && state.pendingRetest) {
             try {
-                await ORBStockBot2.checkRetestAndTrade(symbol, {
+                await ORBStockBot.checkRetestAndTrade(symbol, {
                     direction: state.pendingRetest.direction,
                     breakoutLevel: Number(state.pendingRetest.breakoutLevel)
                 });
@@ -131,7 +131,7 @@ cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => { // Example: every minu
 cron.schedule('00 16 * * 1-5', async () => {
     try {
         for (const symbol of symbols) {
-            await ORBStockBot2.closePosition(symbol);
+            await ORBStockBot.closePosition(symbol);
         }
     } catch (error) {
         console.error("Error closing positions:", error);
