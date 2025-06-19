@@ -8,13 +8,20 @@ const alpaca = new Alpaca({
   paper: true
 });
 
+const fs = require('fs');
+const path = require('path');
+const logFile = path.join(__dirname, 'trade_events.log');
+
+function logTradeEvent(message) {
+  const timestamp = new Date().toISOString();
+  fs.appendFileSync(logFile, `[${timestamp}] ${message}\n`);
+}
+
 const ORB_DURATION_MINUTES = 15;
 const MIN_RRR = 2; // Risk-Reward Ratio
 
 // State per symbol
 const symbolState = {}; // { [symbol]: { orbHigh, orbLow, inPosition } }
-symbolState[symbol] = symbolState[symbol] || {};
-symbolState[symbol].tradeType = null; // 'breakout' or 'retest'
 
 // --- Utility Functions ---
 
@@ -37,6 +44,10 @@ function resetDailyTradeFlags() {
       symbolState[symbol].tradeType = null;
     }
   }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // --- ORB Range Calculation ---
@@ -114,7 +125,12 @@ async function hasOpenOrder(symbol) {
       direction: 'desc',
       limit: 10
     });
-    return orders && orders.length > 0;
+    console.log(`[${symbol}] Open orders:`, orders.map(o => ({id: o.id, status: o.status, side: o.side, type: o.type, class: o.order_class})));
+    return orders.some(order =>
+      (order.status === 'new' || order.status === 'partially_filled') &&
+      (!order.order_class || order.order_class === 'bracket') &&
+      (!order.position_side || order.position_side === 'long' || order.position_side === 'short')
+    );
   } catch (error) {
     console.error(`[${symbol}] Error checking open orders:`, error, error?.response?.data);
     return false;
@@ -124,6 +140,7 @@ async function hasOpenOrder(symbol) {
 // --- Order Placement ---
 
 async function placeBracketOrder(symbol, direction, entry, stop, target) {
+  await sleep(1500); // 1.5 seconds
   try {
     const account = await alpaca.getAccount();
     const qty = calculatePositionSize(Number(account.equity), 0.01, entry, stop);
@@ -154,6 +171,9 @@ async function placeBracketOrder(symbol, direction, entry, stop, target) {
 // --- Breakout Monitoring ---
 
 async function monitorBreakout(symbol) {
+  await syncInPositionWithAlpaca(symbol);
+  symbolState[symbol] = symbolState[symbol] || {};
+
   if (!symbolState[symbol] || symbolState[symbol].orbHigh == null || symbolState[symbol].orbLow == null) {
     console.log(`[${symbol}] ORB range not set. Skipping breakout monitoring.`);
     return;
@@ -265,6 +285,7 @@ async function monitorBreakout(symbol) {
 
   if (breakout) {
       console.log(`[${symbol}] Confirmed breakout (${breakout.direction}) on volume: ${latest.Volume} > ${avgVol.toFixed(2)}`);
+      logTradeEvent(`${symbol} breakout detected at ${latest.ClosePrice} (${breakout.direction})`);
       // Pro-style: Enter immediately on breakout if not in position and no open order
       if (!symbolState[symbol].inPosition && !(await hasOpenOrder(symbol))) {
         const round2 = x => Math.round(x * 100) / 100;
@@ -276,6 +297,7 @@ async function monitorBreakout(symbol) {
           : entry - (stop - entry) * MIN_RRR
         );
         await placeBracketOrder(symbol, breakout.direction, entry, stop, target);
+        logTradeEvent(`${symbol} bracket order placed: entry=${entry}, stop=${stop}, target=${target}`);
         symbolState[symbol].inPosition = true;
         symbolState[symbol].pendingRetest = null;
         symbolState[symbol].barsSinceBreakout = 0;
@@ -297,173 +319,180 @@ async function monitorBreakout(symbol) {
 }
 
 async function checkRetestAndTrade(symbol, retestObj) {
-    // Defensive debug log
-    console.log(`[${symbol}] DEBUG checkRetestAndTrade input:`, JSON.stringify(retestObj));
+  await syncInPositionWithAlpaca(symbol);
+  // Defensive debug log
+  console.log(`[${symbol}] DEBUG checkRetestAndTrade input:`, JSON.stringify(retestObj));
 
-    // Always resync inPosition before making a trade decision
-    await module.exports.syncInPositionWithAlpaca(symbol);
+  // Always resync inPosition before making a trade decision
+  await module.exports.syncInPositionWithAlpaca(symbol);
 
-    let direction, breakoutLevel;
-    if (typeof retestObj === 'object' && retestObj !== null && 'breakoutLevel' in retestObj) {
-        direction = retestObj.direction;
-        breakoutLevel = Number(retestObj.breakoutLevel);
-        symbolState[symbol].pendingRetest = symbolState[symbol].pendingRetest || {};
-        symbolState[symbol].pendingRetest.barsSinceBreakout = (symbolState[symbol].pendingRetest.barsSinceBreakout || 0) + 1;
-    } else {
-        direction = 'long';
-        breakoutLevel = Number(retestObj);
-        symbolState[symbol].pendingRetest = symbolState[symbol].pendingRetest || {};
-        symbolState[symbol].pendingRetest.barsSinceBreakout = (symbolState[symbol].pendingRetest.barsSinceBreakout || 0) + 1;
-    }
+  symbolState[symbol] = symbolState[symbol] || {};
 
-    if (isNaN(breakoutLevel)) {
-        console.error(`[${symbol}] Invalid breakoutLevel:`, breakoutLevel, retestObj);
-        return;
-    }
+  let direction, breakoutLevel;
+  if (typeof retestObj === 'object' && retestObj !== null && 'breakoutLevel' in retestObj) {
+      direction = retestObj.direction;
+      breakoutLevel = Number(retestObj.breakoutLevel);
+      symbolState[symbol].pendingRetest = symbolState[symbol].pendingRetest || {};
+      symbolState[symbol].pendingRetest.barsSinceBreakout = (symbolState[symbol].pendingRetest.barsSinceBreakout || 0) + 1;
+  } else {
+      direction = 'long';
+      breakoutLevel = Number(retestObj);
+      symbolState[symbol].pendingRetest = symbolState[symbol].pendingRetest || {};
+      symbolState[symbol].pendingRetest.barsSinceBreakout = (symbolState[symbol].pendingRetest.barsSinceBreakout || 0) + 1;
+  }
 
-    const today = moment().tz('America/New_York').format('YYYY-MM-DD');
-    const now = moment().tz('America/New_York');
-    const cutoff = moment().tz('America/New_York').hour(14).minute(0).second(0); // set to 11:30 AM ET cutoff when ready to go live
-    const from = now.clone().subtract(4, 'minutes').toISOString();
-    const to = now.clone().subtract(1, 'minutes').toISOString();
-
-    if (now.isAfter(cutoff)) {
-      console.log(`[${symbol}] Past trading cutoff time. Skipping retest.`);
+  if (isNaN(breakoutLevel)) {
+      console.error(`[${symbol}] Invalid breakoutLevel:`, breakoutLevel, retestObj);
       return;
-    }
+  }
 
-    if (
-      symbolState[symbol].hasTradedToday &&
-      symbolState[symbol].lastTradeDate === today
-    ) {
-      console.log(`[${symbol}] Already traded today. Skipping retest.`);
-      return;
-    }
+  const today = moment().tz('America/New_York').format('YYYY-MM-DD');
+  const now = moment().tz('America/New_York');
+  const cutoff = moment().tz('America/New_York').hour(14).minute(0).second(0); // set to 11:30 AM ET cutoff when ready to go live
+  const from = now.clone().subtract(4, 'minutes').toISOString();
+  const to = now.clone().subtract(1, 'minutes').toISOString();
 
-    if (symbolState[symbol].tradeType) {
-      console.log(`[${symbol}] Trade already taken (${symbolState[symbol].tradeType}). Skipping retest.`);
-      return;
-    }
+  if (now.isAfter(cutoff)) {
+    console.log(`[${symbol}] Past trading cutoff time. Skipping retest.`);
+    return;
+  }
 
-    try {
-        const barIterator = await alpaca.getBarsV2(
-            symbol,
-            {
-                start: from,
-                end: to,
-                timeframe: '1Min',
-                adjustment: 'raw',
-                feed: 'iex'
-            },
-            alpaca.configuration
-        );
+  if (
+    symbolState[symbol].hasTradedToday &&
+    symbolState[symbol].lastTradeDate === today
+  ) {
+    console.log(`[${symbol}] Already traded today. Skipping retest.`);
+    return;
+  }
 
-        const bars = [];
-        for await (let bar of barIterator) {
-            bars.push(bar);
-        }
+  if (symbolState[symbol].tradeType) {
+    console.log(`[${symbol}] Trade already taken (${symbolState[symbol].tradeType}). Skipping retest.`);
+    return;
+  }
 
-        if (bars.length < 2) {
-            console.log(`[${symbol}] Not enough candles to evaluate retest.`);
+  try {
+      const barIterator = await alpaca.getBarsV2(
+          symbol,
+          {
+              start: from,
+              end: to,
+              timeframe: '1Min',
+              adjustment: 'raw',
+              feed: 'iex'
+          },
+          alpaca.configuration
+      );
+
+      const bars = [];
+      for await (let bar of barIterator) {
+          bars.push(bar);
+      }
+
+      if (bars.length < 2) {
+          console.log(`[${symbol}] Not enough candles to evaluate retest.`);
+          return;
+      }
+
+      const previousCandle = bars[bars.length - 2];
+      const latestCandle = bars[bars.length - 1];
+
+      console.log(`[${symbol}] Retest Check`);
+      console.log(`Breakout Level: ${breakoutLevel}`);
+      console.log(`Previous Candle:`, previousCandle);
+      console.log(`Latest Candle:`, latestCandle);
+
+      let retest = false;
+      if (direction === 'long') {
+          retest = previousCandle.LowPrice <= breakoutLevel && latestCandle.ClosePrice > breakoutLevel;
+          console.log(`[${symbol}] Long retest logic: prev.LowPrice (${previousCandle.LowPrice}) <= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latestCandle.ClosePrice}) > breakoutLevel (${breakoutLevel}) => ${retest}`);
+      } else {
+          retest = previousCandle.HighPrice >= breakoutLevel && latestCandle.ClosePrice < breakoutLevel;
+          console.log(`[${symbol}] Short retest logic: prev.HighPrice (${previousCandle.HighPrice}) >= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latestCandle.ClosePrice}) < breakoutLevel (${breakoutLevel}) => ${retest}`);
+      }
+
+      const MAX_BARS_WITHOUT_RETEST = 5;
+      const barsSinceBreakout = symbolState[symbol].pendingRetest.barsSinceBreakout || 0;
+      const round2 = x => Math.round(x * 100) / 100;
+
+      // --- Timeout entry logic ---
+      if (!retest && barsSinceBreakout >= MAX_BARS_WITHOUT_RETEST && !symbolState[symbol].inPosition) {
+          console.log(`[${symbol}] No retest after ${MAX_BARS_WITHOUT_RETEST} bars. Entering trade at market.`);
+          const entry = round2(latestCandle.ClosePrice);
+          const stop = round2(direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice);
+          const target = round2(direction === 'long'
+            ? entry + (entry - stop) * MIN_RRR
+            : entry - (stop - entry) * MIN_RRR);
+
+          if (await hasOpenOrder(symbol)) {
+            logTradeEvent(`${symbol} breakout skipped: open order detected`);
+            console.log(`[${symbol}] Skipping order: open order already exists.`);
             return;
-        }
+          }
 
-        const previousCandle = bars[bars.length - 2];
-        const latestCandle = bars[bars.length - 1];
+          try {
+              await placeBracketOrder(symbol, direction, entry, stop, target);
+              symbolState[symbol].inPosition = true;
+              symbolState[symbol].pendingRetest = null;
+              symbolState[symbol].barsSinceBreakout = 0;
+              symbolState[symbol].hasTradedToday = true;
+              symbolState[symbol].lastTradeDate = today;
+              console.log(`[${symbol}] Timeout entry: Bracket order submitted and state updated.`);
+              await module.exports.syncInPositionWithAlpaca(symbol);
+          } catch (error) {
+              symbolState[symbol].inPosition = false;
+              symbolState[symbol].pendingRetest = null;
+              symbolState[symbol].barsSinceBreakout = 0;
+              console.error(`[${symbol}] Error placing order (retest):`, error, error?.response?.data);
+              await module.exports.syncInPositionWithAlpaca(symbol);
+          }
+          return;
+      }
 
-        console.log(`[${symbol}] Retest Check`);
-        console.log(`Breakout Level: ${breakoutLevel}`);
-        console.log(`Previous Candle:`, previousCandle);
-        console.log(`Latest Candle:`, latestCandle);
+      // --- Retest confirmed logic ---
+      if (retest) {
+        logTradeEvent(`${symbol} successful retest at ${latestCandle.ClosePrice} (${direction})`);
+          if (symbolState[symbol].inPosition) {
+              console.log(`[${symbol}] Skipping order: already in position.`);
+          } else {
+              console.log(`[${symbol}] Retest confirmed (${direction}) at ${breakoutLevel}. Entering trade.`);
+              const entry = round2(latestCandle.ClosePrice);
+              const stop = round2(direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice);
+              const target = round2(direction === 'long'
+                ? entry + (entry - stop) * MIN_RRR
+                : entry - (stop - entry) * MIN_RRR);
 
-        let retest = false;
-        if (direction === 'long') {
-            retest = previousCandle.LowPrice <= breakoutLevel && latestCandle.ClosePrice > breakoutLevel;
-            console.log(`[${symbol}] Long retest logic: prev.LowPrice (${previousCandle.LowPrice}) <= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latestCandle.ClosePrice}) > breakoutLevel (${breakoutLevel}) => ${retest}`);
-        } else {
-            retest = previousCandle.HighPrice >= breakoutLevel && latestCandle.ClosePrice < breakoutLevel;
-            console.log(`[${symbol}] Short retest logic: prev.HighPrice (${previousCandle.HighPrice}) >= breakoutLevel (${breakoutLevel}) && latest.ClosePrice (${latestCandle.ClosePrice}) < breakoutLevel (${breakoutLevel}) => ${retest}`);
-        }
+              if (await hasOpenOrder(symbol)) {
+                logTradeEvent(`${symbol} breakout skipped: open order detected`);
+                console.log(`[${symbol}] Skipping order: open order already exists.`);
+                return;
+              }
 
-        const MAX_BARS_WITHOUT_RETEST = 5;
-        const barsSinceBreakout = symbolState[symbol].pendingRetest.barsSinceBreakout || 0;
-        const round2 = x => Math.round(x * 100) / 100;
-
-        // --- Timeout entry logic ---
-        if (!retest && barsSinceBreakout >= MAX_BARS_WITHOUT_RETEST && !symbolState[symbol].inPosition) {
-            console.log(`[${symbol}] No retest after ${MAX_BARS_WITHOUT_RETEST} bars. Entering trade at market.`);
-            const entry = round2(latestCandle.ClosePrice);
-            const stop = round2(direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice);
-            const target = round2(direction === 'long'
-              ? entry + (entry - stop) * MIN_RRR
-              : entry - (stop - entry) * MIN_RRR);
-
-            if (await hasOpenOrder(symbol)) {
-              console.log(`[${symbol}] Skipping order: open order already exists.`);
-              return;
-            }
-
-            try {
-                await placeBracketOrder(symbol, direction, entry, stop, target);
-                symbolState[symbol].inPosition = true;
-                symbolState[symbol].pendingRetest = null;
-                symbolState[symbol].barsSinceBreakout = 0;
-                symbolState[symbol].hasTradedToday = true;
-                symbolState[symbol].lastTradeDate = today;
-                console.log(`[${symbol}] Timeout entry: Bracket order submitted and state updated.`);
-                await module.exports.syncInPositionWithAlpaca(symbol);
-            } catch (error) {
-                symbolState[symbol].inPosition = false;
-                symbolState[symbol].pendingRetest = null;
-                symbolState[symbol].barsSinceBreakout = 0;
-                console.error(`[${symbol}] Error placing order (retest):`, error, error?.response?.data);
-                await module.exports.syncInPositionWithAlpaca(symbol);
-            }
-            return;
-        }
-
-        // --- Retest confirmed logic ---
-        if (retest) {
-            if (symbolState[symbol].inPosition) {
-                console.log(`[${symbol}] Skipping order: already in position.`);
-            } else {
-                console.log(`[${symbol}] Retest confirmed (${direction}) at ${breakoutLevel}. Entering trade.`);
-                const entry = round2(latestCandle.ClosePrice);
-                const stop = round2(direction === 'long' ? latestCandle.LowPrice : latestCandle.HighPrice);
-                const target = round2(direction === 'long'
-                  ? entry + (entry - stop) * MIN_RRR
-                  : entry - (stop - entry) * MIN_RRR);
-
-                if (await hasOpenOrder(symbol)) {
-                  console.log(`[${symbol}] Skipping order: open order already exists.`);
-                  return;
-                }
-
-                try {
-                    console.log(`[${symbol}] Placing bracket order...`);
-                    await placeBracketOrder(symbol, direction, entry, stop, target);
-                    symbolState[symbol].inPosition = true;
-                    symbolState[symbol].pendingRetest = null;
-                    symbolState[symbol].barsSinceBreakout = 0;
-                    symbolState[symbol].hasTradedToday = true;
-                    symbolState[symbol].lastTradeDate = today;
-                    symbolState[symbol].tradeType = 'retest';
-                    console.log(`[${symbol}] Bracket order submitted and state updated.`);
-                    await module.exports.syncInPositionWithAlpaca(symbol);
-                } catch (error) {
-                    symbolState[symbol].inPosition = false;
-                    symbolState[symbol].pendingRetest = null;
-                    symbolState[symbol].barsSinceBreakout = 0;
-                    console.error(`[${symbol}] Error placing order (retest):`, error, error?.response?.data);
-                    await module.exports.syncInPositionWithAlpaca(symbol);
-                }
-            }
-        } else {
-            console.log(`[${symbol}] No retest confirmation for ${direction} at ${breakoutLevel}.`);
-        }
-    } catch (fetchError) {
-        console.error(`[${symbol}] Error fetching bars with getBarsV2:`, fetchError?.response?.data || fetchError.message);
-    }
+              try {
+                  console.log(`[${symbol}] Placing bracket order...`);
+                  await placeBracketOrder(symbol, direction, entry, stop, target);
+                  logTradeEvent(`${symbol} bracket order placed: entry=${entry}, stop=${stop}, target=${target}`);
+                  symbolState[symbol].inPosition = true;
+                  symbolState[symbol].pendingRetest = null;
+                  symbolState[symbol].barsSinceBreakout = 0;
+                  symbolState[symbol].hasTradedToday = true;
+                  symbolState[symbol].lastTradeDate = today;
+                  symbolState[symbol].tradeType = 'retest';
+                  console.log(`[${symbol}] Bracket order submitted and state updated.`);
+                  await module.exports.syncInPositionWithAlpaca(symbol);
+              } catch (error) {
+                  symbolState[symbol].inPosition = false;
+                  symbolState[symbol].pendingRetest = null;
+                  symbolState[symbol].barsSinceBreakout = 0;
+                  console.error(`[${symbol}] Error placing order (retest):`, error, error?.response?.data);
+                  await module.exports.syncInPositionWithAlpaca(symbol);
+              }
+          }
+      } else {
+          console.log(`[${symbol}] No retest confirmation for ${direction} at ${breakoutLevel}.`);
+      }
+  } catch (fetchError) {
+      console.error(`[${symbol}] Error fetching bars with getBarsV2:`, fetchError?.response?.data || fetchError.message);
+  }
 }
 
 
