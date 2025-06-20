@@ -85,8 +85,8 @@ cron.schedule('45 9 * * 1-5', async () => {
     console.log("Finished syncing inPosition state.");
 })();
 
-// Monitor for breakouts for each symbol every minute from 9:46 to 12:59 PM ET
-cron.schedule('46-59 9,0-59 10-15 * * 1-5', async () => {
+// Monitor for breakouts for each symbol every minute from 9:46 to 1:59 PM ET
+cron.schedule('46-59 9,0-59 10-13 * * 1-5', async () => {
 
     if (isRunning) {
         console.log("Previous ORB task still running, skipping this run.");
@@ -111,7 +111,7 @@ cron.schedule('46-59 9,0-59 10-15 * * 1-5', async () => {
 }, { timezone: 'America/New_York' });
 
 // Retest monitor: checks for retest and trade every minute from 9:46
-cron.schedule('46-59 9,0-59 10-12 * * 1-5', async () => { // Example: every minute in the 10am hour
+cron.schedule('46-59 9,0-59 10-13 * * 1-5', async () => { // Example: every minute in the 10am hour
   await Promise.all(symbols.map(async (symbol) => {
         const state = ORBStockBot.symbolState[symbol];
         if (state && state.pendingRetest) {
