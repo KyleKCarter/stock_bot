@@ -1,0 +1,51 @@
+version: '3.8'
+
+# Production override
+services:
+  orbworkeralpaca:
+    command: sh -c "cd ORB_Bot-Alpaca && node validate-bot.js && node orbWorkerAlpaca.js"
+    environment:
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+      - DEVELOPMENT_MODE=false
+      - MOCK_TRADING=false
+      - PAPER_TRADING=true
+      - TZ=America/New_York
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  api:
+    environment:
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.3'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  vwapworker:
+    environment:
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.3'

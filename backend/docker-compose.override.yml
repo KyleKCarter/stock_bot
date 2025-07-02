@@ -1,0 +1,27 @@
+version: '3.8'
+
+# Development override - extends docker-compose.yml
+services:
+  orbworkeralpaca:
+    command: sh -c "cd ORB_Bot-Alpaca && node validate-bot.js && echo 'Starting in development mode...' && node orbWorkerAlpaca.js"
+    environment:
+      - LOG_LEVEL=debug
+      - DEBUG_MODE=true
+      - DEVELOPMENT_MODE=true
+      - MOCK_TRADING=false
+      - PAPER_TRADING=true
+      - TZ=America/New_York
+    volumes:
+      - .:/app  # Mount entire directory for development
+    
+  api:
+    environment:
+      - LOG_LEVEL=debug
+      - DEBUG_MODE=true
+      - TZ=America/New_York
+    volumes:
+      - .:/app
+    
+  # Enable monitoring in development
+  log-monitor:
+    profiles: []  # Remove profile restriction for development

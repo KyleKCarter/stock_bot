@@ -1,23 +1,133 @@
+version: '3.8'
+
 services:
+  # Main API Service
   api:
     build: .
+    container_name: trading-api
     command: node index.js
     ports:
       - "32224:32224"
     env_file:
       - .env
+    environment:
+      - NODE_ENV=production
+      - SERVICE_NAME=API
+    volumes:
+      - ./logs:/app/logs
     restart: unless-stopped
+    networks:
+      - trading-network
 
+  # Legacy ORB Worker (if still needed)
   orbworker:
     build: .
+    container_name: orb-worker-legacy
     command: node ORB_Bot/orbWorker.js
     env_file:
       - .env
+    environment:
+      - NODE_ENV=production
+      - SERVICE_NAME=ORB_LEGACY
+    volumes:
+      - ./logs:/app/logs
     restart: unless-stopped
-  
+    networks:
+      - trading-network
+    profiles:
+      - legacy
+
+  # Enhanced ORB Worker (Primary)
+  orbworkeralpaca:
+    build: .
+    container_name: orb-worker-alpaca
+    command: sh -c "cd ORB_Bot-Alpaca && node validate-bot.js && node orbWorkerAlpaca.js"
+    env_file:
+      - .env
+      - ./ORB_Bot-Alpaca/.env.enhanced  # Load enhanced ORB configuration
+    environment:
+      - NODE_ENV=production
+      - SERVICE_NAME=ORB_ALPACA
+      - WORKER_TYPE=orb-enhanced
+      - TZ=America/New_York  # Critical: Set market timezone
+      # ORB-specific overrides (if needed)
+      - TRADE_COOLDOWN_MINUTES=${TRADE_COOLDOWN_MINUTES:-5}
+      - TREND_CONFIRMATION_ENABLED=${TREND_CONFIRMATION_ENABLED:-true}
+      - MARKET_STRUCTURE_ENABLED=${MARKET_STRUCTURE_ENABLED:-true}
+      - DYNAMIC_POSITION_SIZING=${DYNAMIC_POSITION_SIZING:-true}
+      - VOLUME_FILTER_ENABLED=${VOLUME_FILTER_ENABLED:-true}
+    volumes:
+      - ./ORB_Bot-Alpaca:/app/ORB_Bot-Alpaca
+      - ./logs:/app/logs
+      - /etc/timezone:/etc/timezone:ro  # Mount timezone info
+      - /etc/localtime:/etc/localtime:ro  # Mount local time
+    restart: unless-stopped
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "node", "ORB_Bot-Alpaca/health-check.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      - api
+
+  # VWAP Worker
   vwapworker:
     build: .
+    container_name: vwap-worker
     command: node VWAP_Bot/vwapWorker.js
     env_file:
       - .env
+    environment:
+      - NODE_ENV=production
+      - SERVICE_NAME=VWAP_WORKER
+      - WORKER_TYPE=vwap
+      # VWAP-specific overrides
+      - STOP_LOSS=${STOP_LOSS_VWAP:-0.01}
+      - RISK_REWARD=${RISK_REWARD_VWAP:-2}
+    volumes:
+      - ./VWAP_Bot:/app/VWAP_Bot
+      - ./logs:/app/logs
     restart: unless-stopped
+    networks:
+      - trading-network
+    profiles:
+      - vwap
+
+  # Log Aggregator (Optional)
+  log-monitor:
+    build: .
+    container_name: trading-monitor
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - SERVICE_NAME=MONITOR
+    command: |
+      sh -c "
+        mkdir -p /app/logs
+        echo 'Trading System Monitor Started at $(date)'
+        tail -f /app/logs/*.log 2>/dev/null || echo 'Waiting for log files...'
+        while true; do
+          echo '[$(date)] System Health Check - Containers Running'
+          sleep 300
+        done
+      "
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - trading-network
+    profiles:
+      - monitor
+
+networks:
+  trading-network:
+    driver: bridge
+    name: trading-network
+
+volumes:
+  logs-data:
+    driver: local
