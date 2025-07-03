@@ -38,6 +38,7 @@ const MIN_TP_DIST = process.env.MIN_TP_DIST ? Number(process.env.MIN_TP_DIST) : 
 const MAX_TP_DIST = process.env.MAX_TP_DIST ? Number(process.env.MAX_TP_DIST) : 3.0;   // $3.00 maximum TP distance
 
 const symbolState = {}; // { [symbol]: { orbHigh, orbLow, inPosition } }
+const filteredTrades = {}; // Track filtered trades by reason
 
 // --- Utility Functions ---
 
@@ -307,11 +308,41 @@ async function hasOpenOrder(symbol) {
       direction: 'desc',
       limit: 10
     }));
-    return orders.some(order =>
+    
+    // Filter for actual entry orders only (not stop-loss or take-profit legs)
+    const relevantOrders = orders.filter(order => 
       (order.status === 'new' || order.status === 'partially_filled') &&
-      (!order.order_class || order.order_class === 'bracket') &&
-      (!order.position_side || order.position_side === 'long' || order.position_side === 'short')
+      order.symbol === symbol && // Ensure exact symbol match
+      (
+        // Main bracket order or simple orders
+        (!order.order_class || order.order_class === 'bracket') &&
+        (!order.position_side || order.position_side === 'long' || order.position_side === 'short') &&
+        // Exclude stop-loss and take-profit legs
+        order.order_type !== 'stop' && 
+        order.order_type !== 'limit' &&
+        !order.id.includes('stop_loss') &&
+        !order.id.includes('take_profit')
+      )
     );
+    
+    // Enhanced debugging
+    if (orders.length > 0) {
+      console.log(`[${symbol}] 🔍 Open Order Check:`);
+      console.log(`[${symbol}] - Total open orders found: ${orders.length}`);
+      console.log(`[${symbol}] - Relevant entry orders: ${relevantOrders.length}`);
+      
+      orders.forEach((order, index) => {
+        console.log(`[${symbol}] - Order ${index + 1}: ${order.symbol} ${order.side} ${order.order_type} ${order.status} (class: ${order.order_class || 'simple'}) (id: ${order.id})`);
+      });
+      
+      if (relevantOrders.length > 0) {
+        console.log(`[${symbol}] ⚠️ Active entry orders detected - blocking new trade`);
+      } else {
+        console.log(`[${symbol}] ✅ No active entry orders found - can place new trade`);
+      }
+    }
+    
+    return relevantOrders.length > 0;
   } catch (error) {
     console.error(`[${symbol}] Error checking open orders:`, error, error?.response?.data);
     return false;
@@ -367,13 +398,43 @@ async function monitorBreakout(symbol) {
 
   const today = moment().tz('America/New_York').format('YYYY-MM-DD');
   const now = moment().tz('America/New_York');
-  const cutoff = moment().tz('America/New_York').hour(14).minute(0).second(0); // 2:00 PM ET to match extended window
   
-  // Time-based volume filtering - calculate once for the function
+  // Enhanced holiday and early close detection
+  const holiday = isMarketHoliday(now);
+  const earlyClose = isEarlyCloseDay(now);
+  
+  if (holiday) {
+    console.log(`[${symbol}] 🏖️ Market Holiday: ${holiday} - No trading`);
+    return;
+  }
+  
+  const cutoff = earlyClose ? moment().tz('America/New_York').hour(12).minute(30) : moment().tz('America/New_York').hour(14).minute(0).second(0);
+  if (earlyClose) {
+    console.log(`[${symbol}] ⏰ Early close day - Market closes at ${earlyClose}, adjusted cutoff: ${cutoff.format('HH:mm')}`);
+  }
+  
+  // Enhanced time-based volume filtering with market condition awareness
   const currentHour = now.hour();
+  const currentMinute = now.minute();
   const isLowVolumePeriod = currentHour >= 11 && currentHour <= 13; // 11 AM - 1 PM ET
-  const volumeMultiplier = isLowVolumePeriod ? 1.1 : 1.2; // Lower threshold during lunch period
-  const breakoutVolumeMultiplier = isLowVolumePeriod ? 1.25 : 1.4; // Reduced from 1.5x
+  const isPreHolidayTrading = earlyClose !== null; // Use our enhanced detection
+  const isEarlyCloseDay = isPreHolidayTrading || now.day() === 5; // Friday or pre-holiday
+  
+  // Adjust volume requirements based on market conditions
+  let volumeMultiplier = 1.2;
+  let breakoutVolumeMultiplier = 1.4;
+  
+  if (isLowVolumePeriod) {
+    volumeMultiplier = 1.1;
+    breakoutVolumeMultiplier = 1.25;
+  }
+  
+  // Increase standards on low-conviction days
+  if (isEarlyCloseDay || isPreHolidayTrading) {
+    volumeMultiplier *= 1.3; // Require 30% more volume
+    breakoutVolumeMultiplier *= 1.3;
+    console.log(`[${symbol}] 📅 Pre-holiday/Early close trading - increased volume standards`);
+  }
 
   if (now.isAfter(cutoff)) {
     console.log(`[${symbol}] Skipping breakout monitoring: Past trading cutoff time.`);
@@ -431,18 +492,40 @@ async function monitorBreakout(symbol) {
     return;
   }
 
-  // Time-based volume filtering - more lenient during low-volume periods
-  
+  // Professional volume analysis - exclude high opening volume periods
   let volConfirmed = true;
-  if (recent.length >= 1) {
-    const avgVol = recent.reduce((sum, c) => sum + c.Volume, 0) / recent.length;
-    volConfirmed = latest.Volume > avgVol * volumeMultiplier;
-    console.log(`[${symbol}] Recent post-ORB volumes:`, recent.map(c => c.Volume));
-    console.log(`[${symbol}] Latest post-ORB bar volume:`, latest.Volume);
-    console.log(`[${symbol}] Time: ${now.format('HH:mm')}, Low Volume Period: ${isLowVolumePeriod}, Multiplier: ${volumeMultiplier}x, Avg vol: ${avgVol.toFixed(2)}, Confirmed: ${volConfirmed}`);
+  let avgVol = 0;
+  
+  if (postORB.length >= 3) {
+    // EXCLUDE the first 2 post-ORB bars (9:45-9:55) - typically have inflated volume
+    // Use bars from 9:55 onwards for more representative volume comparison
+    const normalVolumeBars = postORB.length > 6
+      ? postORB.slice(2, -1)  // Skip first 2 bars, exclude latest bar
+      : postORB.slice(1, -1); // Skip first bar if we don't have many bars yet
+    
+    if (normalVolumeBars.length >= 2) {
+      avgVol = normalVolumeBars.reduce((sum, c) => sum + c.Volume, 0) / normalVolumeBars.length;
+      volConfirmed = latest.Volume > avgVol * volumeMultiplier;
+      
+      console.log(`[${symbol}] Professional volume analysis:`);
+      console.log(`[${symbol}] - Excluded high-volume opening bars (first 2 post-ORB)`);
+      console.log(`[${symbol}] - Normal volume bars used: ${normalVolumeBars.length}`);
+      console.log(`[${symbol}] - Normal volume range: ${normalVolumeBars.map(c => c.Volume).join(', ')}`);
+      console.log(`[${symbol}] - Average normal volume: ${avgVol.toFixed(0)}`);
+      console.log(`[${symbol}] - Current bar volume: ${latest.Volume}`);
+      console.log(`[${symbol}] - Required volume: ${(avgVol * volumeMultiplier).toFixed(0)} (${volumeMultiplier}x)`);
+      console.log(`[${symbol}] - Time: ${now.format('HH:mm')}, Low Volume Period: ${isLowVolumePeriod}`);
+      console.log(`[${symbol}] - Volume confirmed: ${volConfirmed}`);
+    } else {
+      // Too early in the day - use simplified check
+      avgVol = latest.Volume;
+      volConfirmed = true; // Be more lenient early in session
+      console.log(`[${symbol}] Early session - simplified volume check (too few normal bars)`);
+    }
   } else {
-    console.log(`[${symbol}] Only one post-ORB bar, skipping volume filter.`);
-    console.log(`[${symbol}] Latest post-ORB bar volume:`, latest.Volume);
+    console.log(`[${symbol}] Very early session - skipping volume filter (only ${postORB.length} post-ORB bars)`);
+    avgVol = latest.Volume;
+    volConfirmed = true;
   }
 
   const ATR = await getATR(symbol, 5); // Use your ATR calculation
@@ -451,40 +534,205 @@ async function monitorBreakout(symbol) {
   const breakoutCandle = latest;
   const candleBody = Math.abs(breakoutCandle.ClosePrice - breakoutCandle.OpenPrice);
 
-  // Calculate average volume of last 5 post-ORB bars (excluding latest)
-  const avgVol = recent.length > 0
-    ? recent.reduce((sum, c) => sum + c.Volume, 0) / recent.length
-    : breakoutCandle.Volume;
+  // Calculate average volume of last 5 post-ORB bars (excluding latest) - using breakout avgVol
+  let normalVolumeBars;
+  const breakoutAvgVol = (() => {
+    if (postORB.length > 6) {
+      normalVolumeBars = postORB.slice(2, -1);
+    } else if (postORB.length > 3) {
+      normalVolumeBars = postORB.slice(1, -1);
+    } else {
+      normalVolumeBars = [];
+    }
+    
+    return normalVolumeBars.length > 0
+      ? normalVolumeBars.reduce((sum, c) => sum + c.Volume, 0) / normalVolumeBars.length
+      : avgVol; // Use the avgVol calculated above
+  })();
 
   // Time-based volume filtering - professional approach
   
   // Filter: require volume based on time period and body less than 1.5x ATR
   if (
-    breakoutCandle.Volume < avgVol * breakoutVolumeMultiplier ||
+    breakoutCandle.Volume < breakoutAvgVol * breakoutVolumeMultiplier ||
     candleBody > ATR * 1.5
   ) {
     console.log(`[${symbol}] Breakout filtered out: volume/body criteria not met.`);
     console.log(`[${symbol}] - Time: ${now.format('HH:mm')}, Low Volume Period: ${isLowVolumePeriod}`);
-    console.log(`[${symbol}] - Volume: ${breakoutCandle.Volume}, AvgVol: ${avgVol}, Required: ${(avgVol * breakoutVolumeMultiplier).toFixed(0)} (${breakoutVolumeMultiplier}x)`);
+    console.log(`[${symbol}] - Volume: ${breakoutCandle.Volume}, AvgVol: ${breakoutAvgVol.toFixed(0)}, Required: ${(breakoutAvgVol * breakoutVolumeMultiplier).toFixed(0)} (${breakoutVolumeMultiplier}x)`);
     console.log(`[${symbol}] - Body: ${candleBody.toFixed(3)}, ATR: ${ATR.toFixed(3)}, Max Body: ${(ATR * 1.5).toFixed(3)}`);
     trackFilteredTrade(symbol, 'volume');
     return; // Skip this breakout
   }
 
+  // Enhanced breakout sustainability check - prevent false breakouts
+  const breakoutSustainabilityCheck = (breakoutDirection, latestCandle, orbLevel) => {
+    const breakoutDistance = breakoutDirection === 'long' 
+      ? latestCandle.ClosePrice - orbLevel 
+      : orbLevel - latestCandle.ClosePrice;
+    
+    const minBreakoutDistance = ATR * 0.3; // Minimum 30% of ATR breakout distance
+    const candleRange = latestCandle.HighPrice - latestCandle.LowPrice;
+    const breakoutStrength = breakoutDistance / candleRange;
+    
+    // Require meaningful breakout distance and good close positioning
+    const sustainabilityScore = {
+      distance: breakoutDistance >= minBreakoutDistance,
+      strength: breakoutStrength >= 0.4, // Close should be at least 40% through candle range
+      closePosition: breakoutDirection === 'long' 
+        ? latestCandle.ClosePrice >= latestCandle.HighPrice * 0.8 // Close in top 20% of candle
+        : latestCandle.ClosePrice <= latestCandle.LowPrice + (candleRange * 0.2) // Close in bottom 20%
+    };
+    
+    const isSustainable = sustainabilityScore.distance && sustainabilityScore.strength && sustainabilityScore.closePosition;
+    
+    console.log(`[${symbol}] 🔍 Breakout Sustainability Check:`);
+    console.log(`[${symbol}] - Distance: ${breakoutDistance.toFixed(3)} (min: ${minBreakoutDistance.toFixed(3)}) ✓${sustainabilityScore.distance ? '✅' : '❌'}`);
+    console.log(`[${symbol}] - Strength: ${breakoutStrength.toFixed(2)} (min: 0.40) ✓${sustainabilityScore.strength ? '✅' : '❌'}`);
+    console.log(`[${symbol}] - Close Position: ${sustainabilityScore.closePosition ? '✅' : '❌'}`);
+    console.log(`[${symbol}] - Overall Sustainable: ${isSustainable ? '✅' : '❌'}`);
+    
+    return isSustainable;
+  };
+
+  // Enhanced market condition analysis
+  const marketCondition = getMarketCondition(symbol, postORB.slice(-10)); // Use last 10 bars
+  
+  // Skip trades in poor market conditions
+  if (marketCondition.quality === 'poor' || marketCondition.quality === 'dangerous') {
+    console.log(`[${symbol}] Trade skipped: Poor market conditions (${marketCondition.quality})`);
+    trackFilteredTrade(symbol, 'market_condition');
+    return;
+  }
+  
+  // Adjust volume requirements based on market condition
+  if (marketCondition.quality === 'good') {
+    // Standard requirements
+  } else if (marketCondition.quality === 'excellent') {
+    // Can be more lenient
+    volumeMultiplier *= 0.9;
+    breakoutVolumeMultiplier *= 0.9;
+  }
+
+  // First check for immediate breakouts (fresh and close to ORB levels)
+  const immediateBreakout = detectImmediateBreakout(symbol, latest, symbolState[symbol].orbHigh, symbolState[symbol].orbLow);
+  
   let breakout = null;
-  if (latest.ClosePrice > symbolState[symbol].orbHigh && volConfirmed) {
-    breakout = { direction: 'long', close: latest.ClosePrice };
-    console.log(`[${symbol}] Breakout detected: LONG at ${latest.ClosePrice} (ORB High: ${symbolState[symbol].orbHigh})`);
-  } else if (latest.ClosePrice < symbolState[symbol].orbLow && volConfirmed) {
-    breakout = { direction: 'short', close: latest.ClosePrice };
-    console.log(`[${symbol}] Breakout detected: SHORT at ${latest.ClosePrice} (ORB Low: ${symbolState[symbol].orbLow})`);
-  } else {
-    console.log(`[${symbol}] No breakout detected. Latest close: ${latest.ClosePrice}, ORB High: ${symbolState[symbol].orbHigh}, ORB Low: ${symbolState[symbol].orbLow}, Vol Confirmed: ${volConfirmed}`);
+  if (immediateBreakout) {
+    // For immediate breakouts, require even stronger volume confirmation
+    const immediateVolumeMultiplier = volumeMultiplier * 1.5; // 50% higher volume requirement
+    const immediateVolConfirmed = latest.Volume >= (avgVol * immediateVolumeMultiplier);
+    
+    if (immediateVolConfirmed) {
+      // Fast-track immediate breakouts with simpler validation
+      const isSustainable = breakoutSustainabilityCheck(immediateBreakout.direction, latest, 
+        immediateBreakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow);
+      
+      if (isSustainable) {
+        breakout = {
+          direction: immediateBreakout.direction,
+          close: latest.ClosePrice,
+          isImmediate: true,
+          preferredEntry: immediateBreakout.entry
+        };
+        console.log(`[${symbol}] ✅ IMMEDIATE ${breakout.direction.toUpperCase()} breakout confirmed at ${latest.ClosePrice}`);
+        console.log(`[${symbol}] - Volume: ${latest.Volume.toLocaleString()} (${(latest.Volume / avgVol).toFixed(1)}x avg)`);
+      } else {
+        console.log(`[${symbol}] ❌ Immediate breakout failed sustainability check`);
+        trackFilteredTrade(symbol, 'sustainability');
+      }
+    } else {
+      console.log(`[${symbol}] ❌ Immediate breakout failed volume requirement (${latest.Volume.toLocaleString()} vs ${(avgVol * immediateVolumeMultiplier).toLocaleString()} needed)`);
+      trackFilteredTrade(symbol, 'volume');
+    }
+  }
+  
+  // If no immediate breakout, check for regular breakouts
+  if (!breakout) {
+    if (latest.ClosePrice > symbolState[symbol].orbHigh && volConfirmed) {
+      // Check sustainability for long breakout
+      const isSustainable = breakoutSustainabilityCheck('long', latest, symbolState[symbol].orbHigh);
+      if (isSustainable) {
+        // Get confirmation score
+        const confirmationAnalysis = getConfirmationScore(symbol, 'long', latest, postORB.slice(-5), marketCondition);
+        const minConfirmationScore = marketCondition.quality === 'excellent' ? 3 : 4; // Require 4/5 confirmations normally
+        
+        if (confirmationAnalysis.score >= minConfirmationScore) {
+          breakout = { direction: 'long', close: latest.ClosePrice, isImmediate: false };
+          console.log(`[${symbol}] ✅ HIGH-QUALITY BREAKOUT: LONG at ${latest.ClosePrice} (ORB High: ${symbolState[symbol].orbHigh})`);
+        } else {
+          console.log(`[${symbol}] ❌ Breakout filtered: Insufficient confirmations (${confirmationAnalysis.score}/${confirmationAnalysis.maxScore})`);
+          trackFilteredTrade(symbol, 'confirmation');
+        }
+      } else {
+        console.log(`[${symbol}] ❌ Breakout filtered: LONG sustainability check failed`);
+        trackFilteredTrade(symbol, 'sustainability');
+      }
+    } else if (latest.ClosePrice < symbolState[symbol].orbLow && volConfirmed) {
+      // Check sustainability for short breakout
+      const isSustainable = breakoutSustainabilityCheck('short', latest, symbolState[symbol].orbLow);
+      if (isSustainable) {
+        // Get confirmation score
+        const confirmationAnalysis = getConfirmationScore(symbol, 'short', latest, postORB.slice(-5), marketCondition);
+        const minConfirmationScore = marketCondition.quality === 'excellent' ? 3 : 4; // Require 4/5 confirmations normally
+        
+        if (confirmationAnalysis.score >= minConfirmationScore) {
+          breakout = { direction: 'short', close: latest.ClosePrice, isImmediate: false };
+          console.log(`[${symbol}] ✅ HIGH-QUALITY BREAKOUT: SHORT at ${latest.ClosePrice} (ORB Low: ${symbolState[symbol].orbLow})`);
+        } else {
+          console.log(`[${symbol}] ❌ Breakout filtered: Insufficient confirmations (${confirmationAnalysis.score}/${confirmationAnalysis.maxScore})`);
+          trackFilteredTrade(symbol, 'confirmation');
+        }
+      } else {
+        console.log(`[${symbol}] ❌ Breakout filtered: SHORT sustainability check failed`);
+        trackFilteredTrade(symbol, 'sustainability');
+      }
+    } else {
+      console.log(`[${symbol}] No breakout detected. Latest close: ${latest.ClosePrice}, ORB High: ${symbolState[symbol].orbHigh}, ORB Low: ${symbolState[symbol].orbLow}, Vol Confirmed: ${volConfirmed}`);
+    }
   }
 
   if (breakout) {
     const round2 = x => Math.round(x * 100) / 100;
-    const entry = round2(latest.ClosePrice);
+    
+    // Smart entry pricing based on breakout type
+    let entry;
+    if (breakout.isImmediate && breakout.preferredEntry) {
+      // Use the optimized immediate entry price
+      entry = breakout.preferredEntry;
+      console.log(`[${symbol}] 🎯 Using immediate breakout entry: $${entry}`);
+    } else {
+      // Enhanced entry logic for delayed breakouts
+      const breakoutLevel = breakout.direction === 'long' ? symbolState[symbol].orbHigh : symbolState[symbol].orbLow;
+      const currentPrice = latest.ClosePrice;
+      const candleRange = latest.HighPrice - latest.LowPrice;
+      
+      if (breakout.direction === 'long') {
+        const distanceFromBreakout = currentPrice - breakoutLevel;
+        
+        // For fresh breakouts (within $0.50), use current price
+        if (distanceFromBreakout <= 0.50) {
+          entry = round2(currentPrice);
+        } else {
+          // For extended breakouts, use a more conservative approach
+          // Enter closer to the breakout level plus a small buffer
+          const maxEntry = breakoutLevel + 0.50; // Don't chase too far
+          entry = round2(Math.min(currentPrice, maxEntry));
+        }
+      } else {
+        const distanceFromBreakout = breakoutLevel - currentPrice;
+        
+        if (distanceFromBreakout <= 0.50) {
+          entry = round2(currentPrice);
+        } else {
+          const maxEntry = breakoutLevel - 0.50; // Don't chase too far
+          entry = round2(Math.max(currentPrice, maxEntry));
+        }
+      }
+      
+      console.log(`[${symbol}] 🎯 Using delayed breakout entry: $${entry} (distance from breakout: $${Math.abs(entry - breakoutLevel).toFixed(2)})`);
+    }
+    
     const atr = await getATR(symbol, 5);
     let rawStop = breakout.direction === 'long'
       ? latest.LowPrice - atr * ATR_MULTIPLIER
@@ -494,15 +742,55 @@ async function monitorBreakout(symbol) {
         ? Math.min(latest.LowPrice - MIN_STOP_DIST, Math.max(rawStop, latest.LowPrice - MAX_STOP_DIST))
         : Math.max(latest.HighPrice + MIN_STOP_DIST, Math.min(rawStop, latest.HighPrice + MAX_STOP_DIST))
     );
-    let rawTarget = breakout.direction === 'long'
-      ? entry + (entry - stop) * MIN_RRR
-      : entry - (stop - entry) * MIN_RRR;
+    // Enhanced target calculation for better risk/reward
+    const riskAmount = Math.abs(entry - stop);
+    const minRewardMultiplier = 2.0; // Minimum 2:1 risk/reward
+    const orbRange = symbolState[symbol].orbHigh - symbolState[symbol].orbLow;
+    
+    // Calculate target based on multiple factors
+    let rawTarget;
+    if (breakout.direction === 'long') {
+      // Consider ORB range, ATR, and risk amount
+      const atrTarget = entry + (atr * 2); // 2x ATR target
+      const orbTarget = entry + orbRange; // ORB range extension
+      const rrTarget = entry + (riskAmount * minRewardMultiplier); // 2:1 minimum
+      
+      // Use the most conservative (lowest) target
+      rawTarget = Math.min(atrTarget, orbTarget, rrTarget);
+    } else {
+      // Short targets
+      const atrTarget = entry - (atr * 2);
+      const orbTarget = entry - orbRange;
+      const rrTarget = entry - (riskAmount * minRewardMultiplier);
+      
+      // Use the most conservative (highest) target
+      rawTarget = Math.max(atrTarget, orbTarget, rrTarget);
+    }
 
     const target = round2(
       breakout.direction === 'long'
         ? Math.max(entry + MIN_TP_DIST, Math.min(rawTarget, entry + MAX_TP_DIST))
         : Math.min(entry - MIN_TP_DIST, Math.max(rawTarget, entry - MAX_TP_DIST))
     );
+    
+    // Final risk/reward validation - ensure we have at least 1.5:1 ratio
+    const finalRiskAmount = Math.abs(entry - stop);
+    const finalRewardAmount = Math.abs(target - entry);
+    const finalRiskReward = finalRewardAmount / finalRiskAmount;
+    
+    if (finalRiskReward < 1.5) {
+      console.log(`[${symbol}] ❌ Trade rejected: Poor risk/reward ratio (${finalRiskReward.toFixed(2)}:1, need ≥1.5:1)`);
+      console.log(`[${symbol}] - Risk: $${finalRiskAmount.toFixed(2)}, Reward: $${finalRewardAmount.toFixed(2)}`);
+      trackFilteredTrade(symbol, 'risk_reward');
+      return;
+    }
+    
+    // Immediate breakouts get slightly relaxed R:R requirements (1.3:1 minimum)
+    if (breakout.isImmediate && finalRiskReward < 1.3) {
+      console.log(`[${symbol}] ❌ Immediate breakout rejected: Poor risk/reward ratio (${finalRiskReward.toFixed(2)}:1, need ≥1.3:1)`);
+      trackFilteredTrade(symbol, 'risk_reward');
+      return;
+    }
 
     if (!symbolState[symbol].inPosition && !(await hasOpenOrder(symbol))) {
       // Check trade cooldown
@@ -534,10 +822,22 @@ async function monitorBreakout(symbol) {
         return;
       }
       
+      // Enhanced confirmation system - require multiple confirmations
+      const confirmation = getConfirmationScore(symbol, breakout.direction, latest, postORB, marketCondition);
+      if (confirmation.score < confirmation.maxScore) {
+        console.log(`[${symbol}] Skipping breakout: insufficient confirmation (${confirmation.score}/${confirmation.maxScore})`);
+        trackFilteredTrade(symbol, 'confirmation');
+        return;
+      }
+      
       console.log(`[${symbol}] ✅ BREAKOUT TRADE SETUP:`);
+      console.log(`[${symbol}] - Type: ${breakout.isImmediate ? 'IMMEDIATE' : 'DELAYED'} breakout`);
       console.log(`[${symbol}] - Direction: ${breakout.direction.toUpperCase()}`);
       console.log(`[${symbol}] - Entry: $${entry}, Stop: $${stop}, Target: $${target}`);
-      console.log(`[${symbol}] - Risk/Reward: ${((target - entry) / (entry - stop)).toFixed(2)}:1`);
+      const riskAmount = Math.abs(entry - stop);
+      const rewardAmount = Math.abs(target - entry);
+      const riskRewardRatio = rewardAmount / riskAmount;
+      console.log(`[${symbol}] - Risk/Reward: ${riskRewardRatio.toFixed(2)}:1 (Risk: $${riskAmount.toFixed(2)}, Reward: $${rewardAmount.toFixed(2)})`);
       console.log(`[${symbol}] - Time: ${now.format('YYYY-MM-DD HH:mm:ss')} ET`);
       console.log(`[${symbol}] - ORB High: $${symbolState[symbol].orbHigh}, ORB Low: $${symbolState[symbol].orbLow}`);
       
@@ -943,22 +1243,11 @@ const performanceStats = {
 };
 
 function trackFilteredTrade(symbol, reason) {
-  if (performanceStats.dailyReset !== moment().tz('America/New_York').format('YYYY-MM-DD')) {
-    // Reset daily stats
-    Object.keys(performanceStats.filteredTrades).forEach(key => {
-      performanceStats.filteredTrades[key] = 0;
-    });
-    performanceStats.totalTrades = 0;
-    performanceStats.breakoutTrades = 0;
-    performanceStats.retestTrades = 0;
-    performanceStats.dailyReset = moment().tz('America/New_York').format('YYYY-MM-DD');
-  }
+  filteredTrades[symbol] = filteredTrades[symbol] || {};
+  filteredTrades[symbol][reason] = (filteredTrades[symbol][reason] || 0) + 1;
   
-  if (performanceStats.filteredTrades[reason] !== undefined) {
-    performanceStats.filteredTrades[reason]++;
-  }
-  
-  console.log(`[${symbol}] Trade filtered: ${reason}. Daily filter stats:`, performanceStats.filteredTrades);
+  const today = moment().tz('America/New_York').format('YYYY-MM-DD');
+  console.log(`[${symbol}] 📊 Trade filtered: ${reason} (Total ${reason}: ${filteredTrades[symbol][reason]})`);
 }
 
 function trackSuccessfulTrade(symbol, type) {
@@ -970,6 +1259,228 @@ function trackSuccessfulTrade(symbol, type) {
   }
   
   console.log(`[${symbol}] Trade executed: ${type}. Daily stats: Total=${performanceStats.totalTrades}, Breakouts=${performanceStats.breakoutTrades}, Retests=${performanceStats.retestTrades}`);
+}
+
+// --- Enhanced market condition detection
+function getMarketCondition(symbol, recentBars) {
+  const volatility = calculateVolatility(recentBars);
+  const avgVolume = recentBars.reduce((sum, bar) => sum + bar.Volume, 0) / recentBars.length;
+  const latestVolume = recentBars[recentBars.length - 1].Volume;
+  
+  // Detect choppy/ranging market conditions
+  const priceRange = Math.max(...recentBars.map(b => b.HighPrice)) - Math.min(...recentBars.map(b => b.LowPrice));
+  const avgBarRange = recentBars.reduce((sum, bar) => sum + (bar.HighPrice - bar.LowPrice), 0) / recentBars.length;
+  const choppiness = avgBarRange / priceRange;
+  
+  const condition = {
+    volatility: volatility > 0.02 ? 'high' : volatility > 0.01 ? 'medium' : 'low',
+    volume: latestVolume > avgVolume * 1.5 ? 'high' : latestVolume > avgVolume * 0.8 ? 'normal' : 'low',
+    choppiness: choppiness > 0.6 ? 'choppy' : choppiness > 0.4 ? 'trending' : 'smooth',
+    quality: 'good' // Will be determined by combination
+  };
+  
+  // Determine overall market quality
+  if (condition.choppiness === 'choppy' && condition.volume === 'low') {
+    condition.quality = 'poor';
+  } else if (condition.choppiness === 'trending' && condition.volume === 'high') {
+    condition.quality = 'excellent';
+  } else if (condition.volatility === 'high' && condition.choppiness === 'choppy') {
+    condition.quality = 'dangerous'; // Like TSLA today
+  }
+  
+  console.log(`[${symbol}] 🌊 Market Condition Assessment:`);
+  console.log(`[${symbol}] - Volatility: ${condition.volatility} (${(volatility * 100).toFixed(2)}%)`);
+  console.log(`[${symbol}] - Volume: ${condition.volume} (${(latestVolume/avgVolume).toFixed(2)}x avg)`);
+  console.log(`[${symbol}] - Choppiness: ${condition.choppiness} (${(choppiness * 100).toFixed(1)}%)`);
+  console.log(`[${symbol}] - Overall Quality: ${condition.quality}`);
+  
+  return condition;
+}
+
+function calculateVolatility(bars) {
+  if (bars.length < 2) return 0;
+  
+  const returns = [];
+  for (let i = 1; i < bars.length; i++) {
+    returns.push((bars[i].ClosePrice - bars[i-1].ClosePrice) / bars[i-1].ClosePrice);
+  }
+  
+  const avgReturn = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+  const variance = returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length;
+  return Math.sqrt(variance);
+}
+
+// Enhanced confirmation system - require multiple confirmations
+function getConfirmationScore(symbol, breakoutDirection, latestCandle, recentBars, marketCondition) {
+  const confirmations = {
+    volume: false,
+    momentum: false,
+    structure: false,
+    timing: false,
+    quality: false
+  };
+  
+  // Volume confirmation (already checked)
+  const avgVol = recentBars.slice(-5).reduce((sum, bar) => sum + bar.Volume, 0) / 5;
+  confirmations.volume = latestCandle.Volume > avgVol * 1.3;
+  
+  // Momentum confirmation - price moving in breakout direction
+  const prevCandle = recentBars[recentBars.length - 2];
+  const momentum = breakoutDirection === 'long' 
+    ? latestCandle.ClosePrice > prevCandle.ClosePrice && latestCandle.ClosePrice > latestCandle.OpenPrice
+    : latestCandle.ClosePrice < prevCandle.ClosePrice && latestCandle.ClosePrice < latestCandle.OpenPrice;
+  confirmations.momentum = momentum;
+  
+  // Structure confirmation - clean breakout without immediate rejection
+  const wickSize = breakoutDirection === 'long'
+    ? latestCandle.HighPrice - latestCandle.ClosePrice
+    : latestCandle.ClosePrice - latestCandle.LowPrice;
+  const bodySize = Math.abs(latestCandle.ClosePrice - latestCandle.OpenPrice);
+  confirmations.structure = wickSize < bodySize * 0.5; // Wick should be less than 50% of body
+  
+  // Timing confirmation - not too late in the day
+  const now = moment().tz('America/New_York');
+  const isGoodTiming = now.hour() < 13 || (now.hour() === 13 && now.minute() < 30);
+  confirmations.timing = isGoodTiming;
+  
+  // Quality confirmation - good market conditions
+  confirmations.quality = marketCondition.quality === 'good' || marketCondition.quality === 'excellent';
+  
+  const score = Object.values(confirmations).filter(c => c).length;
+  const maxScore = Object.keys(confirmations).length;
+  
+  console.log(`[${symbol}] 🎯 Confirmation Analysis:`);
+  console.log(`[${symbol}] - Volume: ${confirmations.volume ? '✅' : '❌'}`);
+  console.log(`[${symbol}] - Momentum: ${confirmations.momentum ? '✅' : '❌'}`);
+  console.log(`[${symbol}] - Structure: ${confirmations.structure ? '✅' : '❌'}`);
+  console.log(`[${symbol}] - Timing: ${confirmations.timing ? '✅' : '❌'}`);
+  console.log(`[${symbol}] - Quality: ${confirmations.quality ? '✅' : '❌'}`);
+  console.log(`[${symbol}] - Score: ${score}/${maxScore} (${(score/maxScore*100).toFixed(1)}%)`);
+  
+  return { score, maxScore, confirmations };
+}
+
+// --- Holiday and early close detection
+function isMarketHoliday(date = moment().tz('America/New_York')) {
+  const holidays = {
+    '2025-07-04': 'Independence Day',
+    '2025-12-25': 'Christmas',
+    '2025-01-01': 'New Year\'s Day',
+    '2025-01-20': 'Martin Luther King Jr. Day',
+    '2025-02-17': 'Presidents Day',
+    '2025-05-26': 'Memorial Day',
+    '2025-09-01': 'Labor Day',
+    '2025-11-27': 'Thanksgiving',
+    '2025-11-28': 'Black Friday'
+  };
+  
+  const dateStr = date.format('YYYY-MM-DD');
+  return holidays[dateStr] || null;
+}
+
+function isEarlyCloseDay(date = moment().tz('America/New_York')) {
+  const earlyCloseDays = {
+    '2025-07-03': '1:00 PM', // Day before July 4th
+    '2025-12-24': '1:00 PM', // Christmas Eve
+    '2025-11-26': '1:00 PM'  // Day after Thanksgiving
+  };
+  
+  const dateStr = date.format('YYYY-MM-DD');
+  return earlyCloseDays[dateStr] || null;
+}
+
+// --- End of day analysis function
+function generateDayAnalysis() {
+  const today = moment().tz('America/New_York').format('YYYY-MM-DD');
+  console.log('\n🔍 === ENHANCED DAILY ANALYSIS ===');
+  console.log(`📅 Date: ${today}`);
+  
+  const holiday = isMarketHoliday();
+  const earlyClose = isEarlyCloseDay();
+  
+  if (holiday) {
+    console.log(`🏖️ Market Holiday: ${holiday}`);
+  } else if (earlyClose) {
+    console.log(`⏰ Early Close Day: Market closed at ${earlyClose}`);
+  }
+  
+  console.log('\n📊 FILTERING PERFORMANCE:');
+  for (const symbol in filteredTrades) {
+    console.log(`\n[${symbol}] Filtered Trades:`);
+    for (const [reason, count] of Object.entries(filteredTrades[symbol])) {
+      console.log(`  - ${reason}: ${count} times`);
+    }
+  }
+  
+  console.log('\n💡 STRATEGY INSIGHTS:');
+  console.log('- Enhanced volume filtering for pre-holiday conditions');
+  console.log('- Breakout sustainability checks to avoid false signals');
+  console.log('- Market condition assessment to skip choppy periods');
+  console.log('- Multi-factor confirmation system for higher quality entries');
+  console.log('- Holiday and early close detection for better timing');
+  
+  console.log('\n🎯 RECOMMENDATIONS:');
+  console.log('- Continue monitoring filtering effectiveness');
+  console.log('- Adjust confirmation thresholds based on market conditions');
+  console.log('- Consider reduced position sizes on low-conviction days');
+  
+  console.log('=== END ENHANCED ANALYSIS ===\n');
+}
+
+// --- Immediate breakout detection - catch breakouts as they happen
+function detectImmediateBreakout(symbol, latest, orbHigh, orbLow) {
+  const round2 = x => Math.round(x * 100) / 100;
+  
+  // Check if this is a fresh breakout (within 1-2 bars of ORB)
+  const longBreakout = latest.ClosePrice > orbHigh;
+  const shortBreakout = latest.ClosePrice < orbLow;
+  
+  if (longBreakout) {
+    const breakoutDistance = latest.ClosePrice - orbHigh;
+    const candleRange = latest.HighPrice - latest.LowPrice;
+    const bodySize = Math.abs(latest.ClosePrice - latest.OpenPrice);
+    
+    // Enhanced criteria for immediate breakout:
+    // 1. Close is very close to ORB high (within $0.30 for tight entries)
+    // 2. Candle shows good momentum (close in upper 70% of range)
+    // 3. Good volume surge (checked in calling function)
+    // 4. Decent body size (not just a wick breakout)
+    const isFresh = breakoutDistance <= 0.30;
+    const hasStrength = latest.ClosePrice >= (latest.LowPrice + candleRange * 0.7);
+    const hasBody = bodySize >= (candleRange * 0.3); // At least 30% body
+    const isGreenCandle = latest.ClosePrice > latest.OpenPrice;
+    
+    if (isFresh && hasStrength && hasBody && isGreenCandle) {
+      console.log(`[${symbol}] 🚀 IMMEDIATE LONG breakout detected - fresh, strong, and quality`);
+      return {
+        direction: 'long',
+        entry: round2(Math.max(orbHigh + 0.02, latest.ClosePrice - 0.05)), // Optimal entry
+        isImmediate: true
+      };
+    }
+  }
+  
+  if (shortBreakout) {
+    const breakoutDistance = orbLow - latest.ClosePrice;
+    const candleRange = latest.HighPrice - latest.LowPrice;
+    const bodySize = Math.abs(latest.ClosePrice - latest.OpenPrice);
+    
+    const isFresh = breakoutDistance <= 0.30;
+    const hasStrength = latest.ClosePrice <= (latest.HighPrice - candleRange * 0.7);
+    const hasBody = bodySize >= (candleRange * 0.3);
+    const isRedCandle = latest.ClosePrice < latest.OpenPrice;
+    
+    if (isFresh && hasStrength && hasBody && isRedCandle) {
+      console.log(`[${symbol}] 🚀 IMMEDIATE SHORT breakout detected - fresh, strong, and quality`);
+      return {
+        direction: 'short',
+        entry: round2(Math.min(orbLow - 0.02, latest.ClosePrice + 0.05)), // Optimal entry
+        isImmediate: true
+      };
+    }
+  }
+  
+  return null;
 }
 
 // --- Exports ---
@@ -990,5 +1501,9 @@ module.exports = {
   getMarketStructure,
   performanceStats,
   trackFilteredTrade,
-  trackSuccessfulTrade
+  trackSuccessfulTrade,
+  getMarketCondition,
+  generateDayAnalysis,
+  isMarketHoliday,
+  isEarlyCloseDay
 };

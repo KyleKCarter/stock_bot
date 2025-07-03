@@ -41,7 +41,7 @@ cron.schedule('25 9 * * 1-5', async () => {
 }, { timezone: 'America/New_York' });
 
 // Reset daily trade flags before market open (9:25 AM ET)
-cron.schedule('28 9 * * 1-5', async () => {
+cron.schedule('25 9 * * 1-5', async () => {
     console.log('\n=== RESETTING DAILY FLAGS ===');
     ORBStockBot.resetDailyTradeFlags();
     
@@ -225,18 +225,23 @@ cron.schedule('0,30 9-15 * * 1-5', async () => {
     console.log('=== END STATUS REPORT ===\n');
 }, { timezone: 'America/New_York' });
 
-// Market close summary
+// Market close summary with enhanced analysis
 cron.schedule('01 16 * * 1-5', async () => {
     console.log('\n=== DAILY SUMMARY ===');
     for (const symbol of symbols) {
         const state = ORBStockBot.symbolState[symbol];
         if (state && state.hasTradedToday) {
-            console.log(`[${symbol}] Traded today: ${state.tradeType || 'unknown type'}`);
+            console.log(`[${symbol}] ✅ Traded today: ${state.tradeType || 'unknown'} at ${state.lastTradeTime || 'unknown time'}`);
         } else {
-            console.log(`[${symbol}] No trades today`);
+            console.log(`[${symbol}] ❌ No trades today`);
         }
     }
     console.log('=== END DAILY SUMMARY ===\n');
+    
+    // Generate enhanced analysis
+    if (ORBStockBot.generateDayAnalysis) {
+        ORBStockBot.generateDayAnalysis();
+    }
 }, { timezone: 'America/New_York' });
 
 // Health check every 15 minutes during market hours
